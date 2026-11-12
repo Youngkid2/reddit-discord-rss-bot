@@ -246,37 +246,58 @@ def download_reddit_video(video_url: str):
         except requests.RequestException:
             return None
 
-    audio = fetch(audio_names[0]) if audio_names else None
     ffmpeg = _ffmpeg_path()
+    audio_tracks = []
+    if ffmpeg:
+        for name in audio_names:
+            data = fetch(name)
+            if data:
+                audio_tracks.append(data)
 
+    def merge(video, audio):
+        with tempfile.TemporaryDirectory() as tmp:
+            v_path = os.path.join(tmp, "v.mp4")
+            a_path = os.path.join(tmp, "a.mp4")
+            out_path = os.path.join(tmp, "out.mp4")
+            with open(v_path, "wb") as f:
+                f.write(video)
+            with open(a_path, "wb") as f:
+                f.write(audio)
+            result = subprocess.run(
+                [ffmpeg, "-y", "-loglevel", "error", "-i", v_path,
+                 "-i", a_path, "-c", "copy", "-map", "0:v:0",
+                 "-map", "1:a:0?", "-movflags", "+faststart", out_path],
+                capture_output=True,
+                timeout=120,
+            )
+            if result.returncode == 0 and os.path.exists(out_path):
+                with open(out_path, "rb") as f:
+                    return f.read()
+        return None
+
+    silent_fallback = None
+
+    # Prefer sound: try every video quality with every audio quality
+    # (best first) and only post a silent video if nothing with sound fits.
     for name in video_names:
         video = fetch(name)
         if not video or len(video) > MAX_MEDIA_UPLOAD_BYTES:
             continue
 
-        if audio and ffmpeg:
-            with tempfile.TemporaryDirectory() as tmp:
-                v_path = os.path.join(tmp, "v.mp4")
-                a_path = os.path.join(tmp, "a.mp4")
-                out_path = os.path.join(tmp, "out.mp4")
-                with open(v_path, "wb") as f:
-                    f.write(video)
-                with open(a_path, "wb") as f:
-                    f.write(audio)
-                result = subprocess.run(
-                    [ffmpeg, "-y", "-loglevel", "error", "-i", v_path,
-                     "-i", a_path, "-c", "copy", "-map", "0:v:0",
-                     "-map", "1:a:0?", "-movflags", "+faststart", out_path],
-                    capture_output=True,
-                    timeout=120,
-                )
-                if result.returncode == 0 and os.path.exists(out_path):
-                    with open(out_path, "rb") as f:
-                        merged = f.read()
-                    if len(merged) <= MAX_MEDIA_UPLOAD_BYTES:
-                        return merged, "reddit_video.mp4"
+        for audio in audio_tracks:
+            merged = merge(video, audio)
+            if merged and len(merged) <= MAX_MEDIA_UPLOAD_BYTES:
+                return merged, "reddit_video.mp4"
 
-        return video, "reddit_video.mp4"
+        if not audio_tracks:
+            return video, "reddit_video.mp4"
+
+        if silent_fallback is None:
+            silent_fallback = video
+
+    if silent_fallback is not None:
+        print(f"Posting Reddit video without sound (too large with audio): {video_url}")
+        return silent_fallback, "reddit_video.mp4"
 
     print(f"No Reddit video quality fits the upload limit: {video_url}")
     return None
