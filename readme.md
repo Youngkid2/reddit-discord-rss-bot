@@ -18,13 +18,22 @@ The bot posts **only** into channels marked age-restricted (`channel.nsfw` / `is
 
 Anyone with **Manage Server** or Administrator permission can use these in the Discord server:
 
-- `/interval` — choose **1**, **2**, or **5** minutes. This changes how often the bot checks Reddit, right away, and the choice is remembered after a restart.
-- `/media` — choose **videos**, **images**, or **both**. This filters what gets posted and is also remembered.
-- `/status` — shows the current interval, media type, and which channels are mapped.
+- `/setup` — the main control panel. On one screen you can pick **subreddits** (comma-separated, with autocomplete and member counts), **interval** (1, 2, or 5 minutes), optional **media** (videos, images, or both), optional **channel** (defaults to the current channel), and optional **timerange** (new, hot, top today, or top this week). Settings are saved per channel. The bot still uses the server-wide `/interval` and `/media` values when a channel has no override. The target channel must be age-restricted.
+- `/interval` — choose **1**, **2**, or **5** minutes as the server-wide default. This changes how often the bot checks Reddit, right away, and the choice is remembered after a restart.
+- `/media` — choose **videos**, **images**, or **both** as the server-wide default. This filters what gets posted and is also remembered.
+- `/status` — shows the server-wide interval and media type, plus each mapped channel's own settings.
 
 The default interval is still `CHECK_INTERVAL_MINUTES` (5 minutes) until you change it. The default media type is both.
 
-If the new commands do not appear after a restart, the bot needs the `applications.commands` scope. Re-invite the **same** bot with that scope, plus the existing permissions (View Channels, Send Messages, Embed Links, Attach Files, Use Slash Commands). Do not create a new bot. Wait a minute after the bot comes online.
+If the new commands do not appear after a restart, the bot needs the `applications.commands` scope. Re-invite the **same** bot with that scope, plus the existing permissions (View Channels, Send Messages, Embed Links, Attach Files, Use Slash Commands). Do not create a new bot. Wait a minute after the bot comes online. Then restart Discord or wait a short moment for the command list to refresh.
+
+## What gets posted
+
+The bot posts **only the image or video**, with no Reddit link and no link preview. The same picture or video is not posted twice in the same channel, even if Reddit lists both a thumbnail and the full file, or the same media appears under a different post id (for example a crosspost).
+
+## Blocked subreddits
+
+The bot will not add, auto-map, or suggest subreddits whose names are minors-related (for example teen, young, loli, shota, jailbait, underage, child, kid, minor, schoolgirl) or rape/non-consent (for example rape, noncon, non_con, nonconsent, cnc, forced, drugged, sleeping, unaware). Other subreddits are allowed.
 
 ## Setup
 
@@ -74,7 +83,7 @@ The FadeHost free plan has no database addon. You do **not** need Postgres or `D
 
 No database, no extra env vars, and no migration commands are required. After the bot comes online, create an age-restricted Discord channel named after the subreddit (for example `#aww` for `r/aww`).
 
-To get an update (for example new `/interval` and `/media` commands): sync your GitHub fork, then tap **Redeploy** or **Restart** on the FadeHost Overview page. When the bot is back online, type `/interval` or `/media` in a channel and pick a choice.
+To get an update (for example the `/setup` panel): sync your GitHub fork, then tap **Redeploy** or **Restart** on the FadeHost Overview page. When the bot is back online, restart Discord or wait a minute, then type `/setup` in an age-restricted channel. If `/setup` does not appear, re-invite the **same** bot with the `applications.commands` scope (do not create a new bot).
 
 ## Useful env vars
 

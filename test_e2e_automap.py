@@ -5,6 +5,7 @@ in testdata/python.new.rss is a real public r/python feed snapshot.
 """
 
 import asyncio
+import contextlib
 import os
 import unittest
 from pathlib import Path
@@ -117,20 +118,44 @@ class EndToEndAutomapTests(unittest.TestCase):
         def has_been_processed(post_id, discord_channel_id):
             return (post_id, str(discord_channel_id)) in self.processed
 
+        def already_posted_to_channel(post_id, discord_channel_id, media_keys=None):
+            return (post_id, str(discord_channel_id)) in self.processed
+
+        def claim_post_for_channel(
+            post_id,
+            title,
+            reddit_url,
+            subreddit_name,
+            discord_channel_id,
+            media_keys=None,
+        ):
+            key = (post_id, str(discord_channel_id))
+            if key in self.processed:
+                return False
+            self.processed.add(key)
+            return True
+
         def mark_as_posted(post_id, title, reddit_url, subreddit_name, discord_channel_id):
             self.processed.add((post_id, str(discord_channel_id)))
+
+        def release_claim(post_id, discord_channel_id, media_keys=None):
+            self.processed.discard((post_id, str(discord_channel_id)))
 
         return (
             patch.object(bot, "client", self.client),
             patch.object(bot, "get_active_subreddit_configs", lambda: []),
             patch.object(bot, "has_been_processed", has_been_processed),
+            patch.object(bot, "already_posted_to_channel", already_posted_to_channel),
+            patch.object(bot, "claim_post_for_channel", claim_post_for_channel),
+            patch.object(bot, "release_claim", release_claim),
             patch.object(bot, "mark_as_posted", mark_as_posted),
+            patch.object(bot, "get_channel_settings", lambda channel_id: None),
         )
 
     def test_collects_only_nsfw_mapped_channel(self):
         with patch.object(bot, "client", self.client), patch.object(
             bot, "get_active_subreddit_configs", lambda: []
-        ):
+        ), patch.object(bot, "get_channel_settings", lambda channel_id: None):
             jobs = bot.collect_channel_jobs()
 
         channel_ids = {job["discord_channel_id"] for job in jobs}
@@ -162,6 +187,9 @@ class EndToEndAutomapTests(unittest.TestCase):
             first_python = list(self.python.sent)
             first_ask = list(self.askreddit.sent)
             first_general = list(self.general.sent)
+            # Clear the due-clock so the second poll actually runs and
+            # has to rely on the dedupe store, not the interval guard.
+            bot._channel_last_checked.clear()
             await bot.check_reddit_posts()
             return first_python, first_ask, first_general
 
@@ -173,7 +201,9 @@ class EndToEndAutomapTests(unittest.TestCase):
                 AsyncMock(side_effect=fake_send),
             ),
         )
-        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+        with contextlib.ExitStack() as stack:
+            for item in patches:
+                stack.enter_context(item)
             first_python, first_ask, first_general = asyncio.run(run_two_polls())
 
         self.assertEqual(len(first_python), 1, "first poll should post exactly one item")

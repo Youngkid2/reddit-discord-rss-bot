@@ -261,11 +261,175 @@ def _init_db_sqlite() -> None:
             )
 
 
+def _ensure_postgres_schema() -> None:
+    """Add columns, indexes, and new tables for existing and fresh Postgres DBs."""
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                ALTER TABLE posted_posts
+                ADD COLUMN IF NOT EXISTS discord_channel_id TEXT;
+                """
+            )
+            cursor.execute(
+                """
+                UPDATE posted_posts
+                SET discord_channel_id = 'legacy'
+                WHERE discord_channel_id IS NULL;
+                """
+            )
+            cursor.execute(
+                """
+                ALTER TABLE posted_posts
+                ALTER COLUMN discord_channel_id SET NOT NULL;
+                """
+            )
+            cursor.execute(
+                """
+                ALTER TABLE posted_posts
+                ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'posted';
+                """
+            )
+            cursor.execute(
+                """
+                ALTER TABLE posted_posts
+                ADD COLUMN IF NOT EXISTS skip_reason TEXT;
+                """
+            )
+            cursor.execute(
+                """
+                ALTER TABLE posted_posts
+                DROP CONSTRAINT IF EXISTS posted_posts_pkey;
+                """
+            )
+            cursor.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS posted_posts_post_channel_uq
+                ON posted_posts (reddit_post_id, discord_channel_id);
+                """
+            )
+            cursor.execute(
+                """
+                ALTER TABLE subreddit_configs
+                ADD COLUMN IF NOT EXISTS feed_modes TEXT DEFAULT 'old,hot,new';
+                """
+            )
+            cursor.execute(
+                """
+                ALTER TABLE subreddit_configs
+                ADD COLUMN IF NOT EXISTS post_limit INTEGER DEFAULT 25;
+                """
+            )
+            cursor.execute(
+                """
+                ALTER TABLE subreddit_configs
+                ADD COLUMN IF NOT EXISTS discord_guild_id TEXT;
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS subreddit_configs_guild_idx
+                ON subreddit_configs (discord_guild_id);
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bot_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS channel_settings (
+                    discord_channel_id TEXT PRIMARY KEY,
+                    discord_guild_id TEXT,
+                    interval_minutes INTEGER,
+                    media_type TEXT,
+                    feed_modes TEXT,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS posted_media (
+                    media_key TEXT NOT NULL,
+                    discord_channel_id TEXT NOT NULL,
+                    reddit_post_id TEXT,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    UNIQUE (media_key, discord_channel_id)
+                );
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS posted_media_channel_idx
+                ON posted_media (discord_channel_id);
+                """
+            )
+
+
+def _ensure_sqlite_schema() -> None:
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS channel_settings (
+                    discord_channel_id TEXT PRIMARY KEY,
+                    discord_guild_id TEXT,
+                    interval_minutes INTEGER,
+                    media_type TEXT,
+                    feed_modes TEXT,
+                    updated_at TEXT DEFAULT (datetime('now'))
+                );
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS posted_media (
+                    media_key TEXT NOT NULL,
+                    discord_channel_id TEXT NOT NULL,
+                    reddit_post_id TEXT,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    UNIQUE (media_key, discord_channel_id)
+                );
+                """
+            )
+            _sqlite_add_column_if_missing(
+                cursor, "channel_settings", "discord_guild_id", "TEXT"
+            )
+            _sqlite_add_column_if_missing(
+                cursor, "channel_settings", "interval_minutes", "INTEGER"
+            )
+            _sqlite_add_column_if_missing(
+                cursor, "channel_settings", "media_type", "TEXT"
+            )
+            _sqlite_add_column_if_missing(
+                cursor, "channel_settings", "feed_modes", "TEXT"
+            )
+            cursor.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS posted_media_key_channel_uq
+                ON posted_media (media_key, discord_channel_id);
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS posted_media_channel_idx
+                ON posted_media (discord_channel_id);
+                """
+            )
+
+
 def init_db() -> None:
     if _use_postgres():
         _init_db_postgres()
+        _ensure_postgres_schema()
     else:
         _init_db_sqlite()
+        _ensure_sqlite_schema()
 
     print("Database initialized successfully.")
 
@@ -819,3 +983,351 @@ def set_media_type(media_type: str) -> bool:
     if kind not in ALLOWED_MEDIA_TYPES:
         return False
     return set_bot_setting(SETTING_MEDIA, kind)
+
+
+
+def _row_channel_settings(row) -> dict | None:
+    if not row:
+        return None
+    interval = row[1]
+    try:
+        interval = int(interval) if interval is not None else None
+    except (TypeError, ValueError):
+        interval = None
+    return {
+        "discord_channel_id": row[0],
+        "interval_minutes": interval,
+        "media_type": row[2],
+        "feed_modes": row[3],
+        "discord_guild_id": row[4],
+    }
+
+
+def get_channel_settings(discord_channel_id: str) -> dict | None:
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    discord_channel_id,
+                    interval_minutes,
+                    media_type,
+                    feed_modes,
+                    discord_guild_id
+                FROM channel_settings
+                WHERE discord_channel_id = %s;
+                """,
+                (str(discord_channel_id),),
+            )
+            return _row_channel_settings(cursor.fetchone())
+
+
+def list_channel_settings(discord_guild_id: str | None = None) -> list[dict]:
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            if discord_guild_id:
+                cursor.execute(
+                    """
+                    SELECT
+                        discord_channel_id,
+                        interval_minutes,
+                        media_type,
+                        feed_modes,
+                        discord_guild_id
+                    FROM channel_settings
+                    WHERE discord_guild_id = %s
+                    ORDER BY discord_channel_id ASC;
+                    """,
+                    (str(discord_guild_id),),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT
+                        discord_channel_id,
+                        interval_minutes,
+                        media_type,
+                        feed_modes,
+                        discord_guild_id
+                    FROM channel_settings
+                    ORDER BY discord_channel_id ASC;
+                    """
+                )
+            return [
+                settings
+                for settings in (_row_channel_settings(row) for row in cursor.fetchall())
+                if settings
+            ]
+
+
+def upsert_channel_settings(
+    discord_channel_id: str,
+    discord_guild_id: str | None = None,
+    interval_minutes: int | None = None,
+    media_type: str | None = None,
+    feed_modes: str | None = None,
+    overwrite: bool = False,
+) -> bool:
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cursor:
+                if overwrite:
+                    cursor.execute(
+                        """
+                        INSERT INTO channel_settings (
+                            discord_channel_id,
+                            discord_guild_id,
+                            interval_minutes,
+                            media_type,
+                            feed_modes
+                        )
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (discord_channel_id)
+                        DO UPDATE SET
+                            discord_guild_id = COALESCE(EXCLUDED.discord_guild_id, channel_settings.discord_guild_id),
+                            interval_minutes = EXCLUDED.interval_minutes,
+                            media_type = EXCLUDED.media_type,
+                            feed_modes = EXCLUDED.feed_modes;
+                        """,
+                        (
+                            str(discord_channel_id),
+                            discord_guild_id,
+                            interval_minutes,
+                            media_type,
+                            feed_modes,
+                        ),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        INSERT INTO channel_settings (
+                            discord_channel_id,
+                            discord_guild_id,
+                            interval_minutes,
+                            media_type,
+                            feed_modes
+                        )
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (discord_channel_id)
+                        DO UPDATE SET
+                            discord_guild_id = COALESCE(EXCLUDED.discord_guild_id, channel_settings.discord_guild_id),
+                            interval_minutes = COALESCE(EXCLUDED.interval_minutes, channel_settings.interval_minutes),
+                            media_type = COALESCE(EXCLUDED.media_type, channel_settings.media_type),
+                            feed_modes = COALESCE(EXCLUDED.feed_modes, channel_settings.feed_modes);
+                        """,
+                        (
+                            str(discord_channel_id),
+                            discord_guild_id,
+                            interval_minutes,
+                            media_type,
+                            feed_modes,
+                        ),
+                    )
+        return True
+    except Exception as error:
+        print(f"Failed to save channel settings for {discord_channel_id}: {error}")
+        return False
+
+
+def list_channel_intervals() -> list[int]:
+    settings = list_channel_settings()
+    values = []
+    for row in settings:
+        minutes = parse_interval(row.get("interval_minutes"))
+        if minutes is not None:
+            values.append(minutes)
+    return values
+
+
+def replace_channel_subreddit_configs(
+    discord_channel_id: str,
+    discord_guild_id: str | None,
+    subreddit_names: list[str],
+    feed_modes: str = "old,hot,new",
+    post_limit: int = 25,
+) -> list[str]:
+    """Replace the saved subreddit mappings for one channel."""
+    channel_id = str(discord_channel_id)
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                DELETE FROM subreddit_configs
+                WHERE discord_channel_id = %s;
+                """,
+                (channel_id,),
+            )
+    saved = []
+    for name in subreddit_names:
+        upsert_subreddit_config(
+            subreddit_name=name,
+            discord_channel_id=channel_id,
+            feed_modes=feed_modes,
+            post_limit=post_limit,
+            discord_guild_id=discord_guild_id,
+        )
+        saved.append(name)
+    return saved
+
+
+def has_media_been_processed(media_key: str, discord_channel_id: str) -> bool:
+    if not media_key:
+        return False
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT 1
+                FROM posted_media
+                WHERE media_key = %s
+                AND discord_channel_id = %s;
+                """,
+                (media_key, str(discord_channel_id)),
+            )
+            return cursor.fetchone() is not None
+
+
+def already_posted_to_channel(post_id: str, discord_channel_id: str, media_keys: list[str] | None = None) -> bool:
+    if has_been_processed(post_id, discord_channel_id):
+        return True
+    for key in media_keys or []:
+        if has_media_been_processed(key, discord_channel_id):
+            return True
+    return False
+
+
+def claim_post_for_channel(
+    post_id: str,
+    title: str,
+    reddit_url: str,
+    subreddit_name: str,
+    discord_channel_id: str,
+    media_keys: list[str] | None = None,
+) -> bool:
+    """
+    Atomically reserve a Reddit post and its media for this channel.
+
+    Returns False if the post id or any media key is already claimed.
+    The row is stored as status='pending' until mark_as_posted() or
+    release_claim() runs.
+    """
+    channel_id = str(discord_channel_id)
+    keys = []
+    seen = set()
+    for key in media_keys or []:
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        keys.append(key)
+
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cursor:
+                for key in keys:
+                    cursor.execute(
+                        """
+                        SELECT 1
+                        FROM posted_media
+                        WHERE media_key = %s
+                        AND discord_channel_id = %s;
+                        """,
+                        (key, channel_id),
+                    )
+                    if cursor.fetchone() is not None:
+                        conn.rollback()
+                        return False
+
+                cursor.execute(
+                    """
+                    INSERT INTO posted_posts (
+                        reddit_post_id,
+                        title,
+                        reddit_url,
+                        subreddit_name,
+                        discord_channel_id,
+                        status,
+                        skip_reason
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (reddit_post_id, discord_channel_id)
+                    DO NOTHING;
+                    """,
+                    (
+                        post_id,
+                        title,
+                        reddit_url,
+                        subreddit_name,
+                        channel_id,
+                        "pending",
+                        None,
+                    ),
+                )
+                if cursor.rowcount == 0:
+                    conn.rollback()
+                    return False
+
+                for key in keys:
+                    cursor.execute(
+                        """
+                        INSERT INTO posted_media (
+                            media_key,
+                            discord_channel_id,
+                            reddit_post_id
+                        )
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (media_key, discord_channel_id)
+                        DO NOTHING;
+                        """,
+                        (key, channel_id, post_id),
+                    )
+                    if cursor.rowcount == 0:
+                        conn.rollback()
+                        return False
+        return True
+    except Exception as error:
+        print(
+            f"Failed to claim post {post_id} for channel {channel_id}: {error}"
+        )
+        return False
+
+
+def release_claim(
+    post_id: str,
+    discord_channel_id: str,
+    media_keys: list[str] | None = None,
+) -> None:
+    """Drop a pending claim so the post can be retried later."""
+    channel_id = str(discord_channel_id)
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    DELETE FROM posted_posts
+                    WHERE reddit_post_id = %s
+                    AND discord_channel_id = %s
+                    AND status = %s;
+                    """,
+                    (post_id, channel_id, "pending"),
+                )
+                cursor.execute(
+                    """
+                    DELETE FROM posted_media
+                    WHERE reddit_post_id = %s
+                    AND discord_channel_id = %s;
+                    """,
+                    (post_id, channel_id),
+                )
+                for key in media_keys or []:
+                    cursor.execute(
+                        """
+                        DELETE FROM posted_media
+                        WHERE media_key = %s
+                        AND discord_channel_id = %s;
+                        """,
+                        (key, channel_id),
+                    )
+    except Exception as error:
+        print(
+            f"Failed to release claim for {post_id} in channel {channel_id}: {error}"
+        )
