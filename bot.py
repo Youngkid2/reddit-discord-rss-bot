@@ -28,6 +28,13 @@ from db import (
     set_subreddit_active,
     clear_processed_posts_for_subreddit,
     set_subreddit_carousels,
+    get_check_interval_minutes,
+    get_media_type,
+    set_check_interval_minutes,
+    set_media_type,
+    parse_interval,
+    post_matches_media_filter,
+    ALLOWED_MEDIA_TYPES,
 )
 from reddit_fetcher import fetch_latest_posts
 from channel_map import (
@@ -109,8 +116,19 @@ async def on_ready():
         await sync_slash_commands_to_all_guilds()
         slash_commands_synced = True
 
+    effective_interval = CHECK_INTERVAL_MINUTES
+    effective_media = "both"
+    try:
+        effective_interval = get_check_interval_minutes(default=CHECK_INTERVAL_MINUTES)
+        effective_media = get_media_type()
+    except Exception as error:
+        print(f"Failed to load saved settings, using defaults: {error}")
+
+    apply_check_interval(effective_interval)
+
     print(f"Feed modes: {FEED_MODES}")
-    print(f"Check interval: {CHECK_INTERVAL_MINUTES} minutes")
+    print(f"Check interval: {effective_interval} minutes")
+    print(f"Media type: {effective_media}")
     print(f"Post candidate limit: {POST_LIMIT}")
     print(f"Ignored channels: {sorted(IGNORE_CHANNELS) or '(none)'}")
     print(f"Channel overrides: {CHANNEL_SUBREDDIT_OVERRIDES or '(none)'}")
@@ -740,6 +758,41 @@ def fetch_posts_for_candidates(candidates: list[str], feed_mode: str, limit: int
     return last_name, []
 
 
+def apply_check_interval(minutes: int) -> bool:
+    """
+    Change the posting-loop interval live. Failures are logged and the
+    current interval is left unchanged.
+    """
+    try:
+        minutes = normalize_interval_for_loop(minutes)
+        check_reddit_posts.change_interval(minutes=minutes)
+        return True
+    except Exception as error:
+        print(f"Failed to apply check interval, keeping current value: {error}")
+        return False
+
+
+def normalize_interval_for_loop(minutes: int) -> int:
+    parsed = parse_interval(minutes)
+    if parsed is not None:
+        return parsed
+    try:
+        fallback = int(minutes)
+        if fallback > 0:
+            return fallback
+    except (TypeError, ValueError):
+        pass
+    return CHECK_INTERVAL_MINUTES if CHECK_INTERVAL_MINUTES > 0 else 5
+
+
+def current_media_type() -> str:
+    try:
+        return get_media_type()
+    except Exception as error:
+        print(f"Failed to read media type, using both: {error}")
+        return "both"
+
+
 @tasks.loop(minutes=CHECK_INTERVAL_MINUTES)
 async def check_reddit_posts():
     global rotation_pointer
@@ -823,6 +876,18 @@ async def check_reddit_posts():
                         f"No usable direct media URLs, skipping: {title}"
                     )
                     continue
+
+                try:
+                    media_type = current_media_type()
+                    if not post_matches_media_filter(post, media_type):
+                        print(
+                            f"Media filter is {media_type}, skipping: {title}"
+                        )
+                        continue
+                except Exception as error:
+                    print(
+                        f"Media filter failed, posting anyway: {error}"
+                    )
 
                 # Final safety check immediately before sending.
                 if not channel_is_age_restricted(channel):
@@ -1338,6 +1403,12 @@ async def drbot_fetch(
         if not image_urls and not video_urls:
             continue
 
+        try:
+            if not post_matches_media_filter(post, current_media_type()):
+                continue
+        except Exception:
+            pass
+
         media_was_sent = await send_reddit_post_to_discord(
             channel=target_channel,
             post=post,
@@ -1365,6 +1436,201 @@ async def drbot_fetch(
         f"No unprocessed media/candidate posts found for `r/{subreddit}` using `{mode}`.",
         ephemeral=True,
     )
+
+
+def require_manage_server(interaction: discord.Interaction) -> str | None:
+    """Return an error message if the user cannot use admin commands."""
+    if not interaction.guild or not interaction.guild_id:
+        return "This command can only be used inside a Discord server."
+    if not user_can_manage_bot(interaction):
+        return "You need Manage Server or Administrator permission to use this."
+    return None
+
+
+@tree.command(
+    name="interval",
+    description="Set how often the bot checks Reddit (1, 2, or 5 minutes).",
+)
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.describe(minutes="How often the bot should check Reddit")
+@app_commands.choices(
+    minutes=[
+        app_commands.Choice(name="1 minute", value=1),
+        app_commands.Choice(name="2 minutes", value=2),
+        app_commands.Choice(name="5 minutes", value=5),
+    ]
+)
+async def interval_command(
+    interaction: discord.Interaction,
+    minutes: int,
+):
+    try:
+        error = require_manage_server(interaction)
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+
+        parsed = parse_interval(minutes)
+        if parsed is None:
+            await interaction.response.send_message(
+                "Please choose 1, 2, or 5 minutes.",
+                ephemeral=True,
+            )
+            return
+
+        saved = set_check_interval_minutes(parsed)
+        applied = apply_check_interval(parsed)
+
+        if applied and saved:
+            await interaction.response.send_message(
+                f"Done. The bot will now check Reddit every **{parsed} minute(s)**.",
+                ephemeral=True,
+            )
+            return
+
+        if applied and not saved:
+            await interaction.response.send_message(
+                f"The bot will now check Reddit every **{parsed} minute(s)**, "
+                "but I could not save this for the next restart. Try the command again later.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            "I could not change the interval right now. The bot is still using the previous setting.",
+            ephemeral=True,
+        )
+    except Exception as error:
+        print(f"/interval command failed: {error}")
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                "Something went wrong while changing the interval. The bot is still posting as before.",
+                ephemeral=True,
+            )
+
+
+@tree.command(
+    name="media",
+    description="Choose whether the bot posts videos, images, or both.",
+)
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.describe(media_type="What the bot should post")
+@app_commands.choices(
+    media_type=[
+        app_commands.Choice(name="videos only", value="videos"),
+        app_commands.Choice(name="images only", value="images"),
+        app_commands.Choice(name="both", value="both"),
+    ]
+)
+async def media_command(
+    interaction: discord.Interaction,
+    media_type: str,
+):
+    try:
+        error = require_manage_server(interaction)
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+
+        kind = media_type.strip().lower() if isinstance(media_type, str) else ""
+        if kind not in ALLOWED_MEDIA_TYPES:
+            await interaction.response.send_message(
+                "Please choose videos, images, or both.",
+                ephemeral=True,
+            )
+            return
+
+        saved = set_media_type(kind)
+        labels = {
+            "videos": "videos only",
+            "images": "images only",
+            "both": "both images and videos",
+        }
+        label = labels[kind]
+
+        if saved:
+            await interaction.response.send_message(
+                f"Done. The bot will now post **{label}**.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            "I could not save that media setting right now. The bot will keep using the previous setting.",
+            ephemeral=True,
+        )
+    except Exception as error:
+        print(f"/media command failed: {error}")
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                "Something went wrong while changing the media setting. The bot is still posting as before.",
+                ephemeral=True,
+            )
+
+
+@tree.command(
+    name="status",
+    description="Show the current interval, media type, and mapped channels.",
+)
+@app_commands.default_permissions(manage_guild=True)
+async def status_command(interaction: discord.Interaction):
+    try:
+        error = require_manage_server(interaction)
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+
+        try:
+            interval = get_check_interval_minutes(default=CHECK_INTERVAL_MINUTES)
+        except Exception:
+            interval = CHECK_INTERVAL_MINUTES
+
+        try:
+            media_type = get_media_type()
+        except Exception:
+            media_type = "both"
+
+        lines = [
+            f"Check interval: **{interval} minute(s)**",
+            f"Media type: **{media_type}**",
+            "",
+            "Mapped age-restricted channels:",
+        ]
+
+        try:
+            jobs = collect_channel_jobs()
+        except Exception as job_error:
+            print(f"/status could not list channels: {job_error}")
+            jobs = []
+
+        seen_channels = set()
+        mapped_lines = []
+        for job in jobs:
+            channel_id = job["discord_channel_id"]
+            if channel_id in seen_channels:
+                continue
+            seen_channels.add(channel_id)
+            names = " / ".join(f"r/{name}" for name in job["subreddit_candidates"])
+            mapped_lines.append(f"- <#{channel_id}> → {names}")
+
+        if mapped_lines:
+            lines.extend(mapped_lines)
+        else:
+            lines.append("- None yet. Create an age-restricted channel named after the subreddit.")
+
+        message = "\n".join(lines)
+        if len(message) > 1800:
+            message = message[:1800] + "\n...truncated"
+
+        await interaction.response.send_message(message, ephemeral=True)
+    except Exception as error:
+        print(f"/status command failed: {error}")
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                "Something went wrong while reading the current settings.",
+                ephemeral=True,
+            )
+
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN:

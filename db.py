@@ -171,6 +171,14 @@ def _init_db_postgres() -> None:
                 BOOLEAN NOT NULL DEFAULT FALSE;
                 """
             )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bot_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                """
+            )
 
 
 def _init_db_sqlite() -> None:
@@ -241,6 +249,14 @@ def _init_db_sqlite() -> None:
                 """
                 CREATE INDEX IF NOT EXISTS subreddit_configs_guild_idx
                 ON subreddit_configs (discord_guild_id);
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bot_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
                 """
             )
 
@@ -653,3 +669,153 @@ def set_subreddit_carousels(
                 )
 
             return cursor.rowcount
+
+SETTING_INTERVAL = "check_interval_minutes"
+SETTING_MEDIA = "media_type"
+ALLOWED_INTERVALS = frozenset({1, 2, 5})
+ALLOWED_MEDIA_TYPES = frozenset({"videos", "images", "both"})
+DEFAULT_MEDIA_TYPE = "both"
+
+
+def parse_interval(value):
+    """Return 1, 2, or 5 if value is one of those, otherwise None."""
+    try:
+        minutes = int(value)
+    except (TypeError, ValueError):
+        return None
+    if minutes in ALLOWED_INTERVALS:
+        return minutes
+    return None
+
+
+def normalize_interval(value, default: int = 5) -> int:
+    """
+    Prefer a valid saved choice (1, 2, or 5).
+
+    If that is missing or invalid, use default (the CHECK_INTERVAL_MINUTES
+    env value, which may be any positive integer). Last resort is 5.
+    """
+    parsed = parse_interval(value)
+    if parsed is not None:
+        return parsed
+    try:
+        fallback = int(default)
+        if fallback > 0:
+            return fallback
+    except (TypeError, ValueError):
+        pass
+    return 5
+
+
+def normalize_media_type(value, default: str = DEFAULT_MEDIA_TYPE) -> str:
+    if isinstance(value, str):
+        kind = value.strip().lower()
+        if kind in ALLOWED_MEDIA_TYPES:
+            return kind
+    if isinstance(default, str) and default.strip().lower() in ALLOWED_MEDIA_TYPES:
+        return default.strip().lower()
+    return DEFAULT_MEDIA_TYPE
+
+
+def post_matches_media_filter(post: dict, media_type: str | None = None) -> bool:
+    """
+    Return True if this Reddit post should be posted for the given media filter.
+
+    Video posts often include a thumbnail image, so "images" means image-only
+    posts (no video URLs) and "videos" means posts that have a video URL.
+    Invalid media_type values fall back to "both".
+    """
+    kind = normalize_media_type(media_type)
+    image_urls = post.get("image_urls") or []
+    video_urls = post.get("video_urls") or []
+
+    if kind == "videos":
+        return bool(video_urls)
+    if kind == "images":
+        return bool(image_urls) and not video_urls
+    return bool(image_urls or video_urls)
+
+
+def _ensure_settings_table(cursor) -> None:
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bot_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        """
+    )
+
+
+def get_bot_setting(key: str, default: str | None = None) -> str | None:
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cursor:
+                _ensure_settings_table(cursor)
+                cursor.execute(
+                    """
+                    SELECT value
+                    FROM bot_settings
+                    WHERE key = %s;
+                    """,
+                    (key,),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return default
+                return row[0]
+    except Exception as error:
+        print(f"Failed to read setting {key}, using default: {error}")
+        return default
+
+
+def set_bot_setting(key: str, value: str) -> bool:
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cursor:
+                _ensure_settings_table(cursor)
+                cursor.execute(
+                    """
+                    INSERT INTO bot_settings (key, value)
+                    VALUES (%s, %s)
+                    ON CONFLICT (key)
+                    DO UPDATE SET value = EXCLUDED.value;
+                    """,
+                    (key, value),
+                )
+        return True
+    except Exception as error:
+        print(f"Failed to save setting {key}: {error}")
+        return False
+
+
+def get_check_interval_minutes(default: int = 5) -> int:
+    try:
+        return normalize_interval(get_bot_setting(SETTING_INTERVAL), default=default)
+    except Exception as error:
+        print(f"Failed to load check interval, using default: {error}")
+        return normalize_interval(None, default=default)
+
+
+def get_media_type(default: str = DEFAULT_MEDIA_TYPE) -> str:
+    try:
+        return normalize_media_type(get_bot_setting(SETTING_MEDIA), default=default)
+    except Exception as error:
+        print(f"Failed to load media type, using default: {error}")
+        return normalize_media_type(None, default=default)
+
+
+def set_check_interval_minutes(minutes: int) -> bool:
+    parsed = parse_interval(minutes)
+    if parsed is None:
+        return False
+    return set_bot_setting(SETTING_INTERVAL, str(parsed))
+
+
+def set_media_type(media_type: str) -> bool:
+    if not isinstance(media_type, str):
+        return False
+    kind = media_type.strip().lower()
+    if kind not in ALLOWED_MEDIA_TYPES:
+        return False
+    return set_bot_setting(SETTING_MEDIA, kind)

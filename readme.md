@@ -14,12 +14,24 @@ Posts new Reddit media into Discord. Each **age-restricted** text channel is map
 
 The bot posts **only** into channels marked age-restricted (`channel.nsfw` / `is_nsfw()`). Any other channel is skipped and logged. This is enforced on the scheduled loop and on slash commands.
 
+## Commands
+
+Anyone with **Manage Server** or Administrator permission can use these in the Discord server:
+
+- `/interval` — choose **1**, **2**, or **5** minutes. This changes how often the bot checks Reddit, right away, and the choice is remembered after a restart.
+- `/media` — choose **videos**, **images**, or **both**. This filters what gets posted and is also remembered.
+- `/status` — shows the current interval, media type, and which channels are mapped.
+
+The default interval is still `CHECK_INTERVAL_MINUTES` (5 minutes) until you change it. The default media type is both.
+
+If the new commands do not appear after a restart, the bot needs the `applications.commands` scope. Re-invite the **same** bot with that scope, plus the existing permissions (View Channels, Send Messages, Embed Links, Attach Files, Use Slash Commands). Do not create a new bot. Wait a minute after the bot comes online.
+
 ## Setup
 
 1. Create a Discord application and bot at the [Discord Developer Portal](https://discord.com/developers/applications).
 2. Copy the bot token into `.env` as `DISCORD_TOKEN` (see `.env.example`).
 3. In the portal, under **Bot**, you do **not** need privileged intents (no Message Content or Server Members). Default gateway intents are enough.
-4. Invite the bot with permissions: **View Channels**, **Send Messages**, **Embed Links**, **Attach Files**, and **Use Slash Commands**.
+4. Invite the bot with the `bot` and `applications.commands` scopes, and permissions: **View Channels**, **Send Messages**, **Embed Links**, **Attach Files**, and **Use Slash Commands**.
 5. In your server, mark each target channel as **Age-restricted** and name it after the subreddit (for example `#aww` → `r/aww`).
 6. Copy `.env.example` to `.env` and fill in `DISCORD_TOKEN`.
 
@@ -61,6 +73,8 @@ The FadeHost free plan has no database addon. You do **not** need Postgres or `D
 3. The bot stores its data in a SQLite file on the persistent disk at `/data/bot.db` (3 GB is plenty).
 
 No database, no extra env vars, and no migration commands are required. After the bot comes online, create an age-restricted Discord channel named after the subreddit (for example `#aww` for `r/aww`).
+
+To get an update (for example new `/interval` and `/media` commands): sync your GitHub fork, then tap **Redeploy** or **Restart** on the FadeHost Overview page. When the bot is back online, type `/interval` or `/media` in a channel and pick a choice.
 
 ## Useful env vars
 
