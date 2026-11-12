@@ -113,6 +113,7 @@ class EndToEndAutomapTests(unittest.TestCase):
         bot.INCLUDE_CAROUSELS = True
         bot.IGNORE_CHANNELS = {"general", "rules", "announcements"}
         bot.CHANNEL_SUBREDDIT_OVERRIDES = {}
+        bot._channel_last_checked.clear()
 
     def _db_patches(self):
         def has_been_processed(post_id, discord_channel_id):

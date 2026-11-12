@@ -1,5 +1,6 @@
 """Unit tests for the blocklist, autocomplete parsing, per-channel settings, and dedupe."""
 
+import asyncio
 import os
 import tempfile
 import time
@@ -335,3 +336,216 @@ class SetupAndClaimTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SlashAckAndAutocompleteTests(unittest.IsolatedAsyncioTestCase):
+    async def test_autocomplete_times_out_and_returns_empty(self):
+        def slow_search(query, limit=15):
+            time.sleep(5)
+            return [{"name": "aww", "subscribers": 1000}]
+
+        start = time.monotonic()
+        with patch.object(bot, "search_subreddits", slow_search):
+            results = await bot.search_subreddits_for_autocomplete("aww", 15)
+        elapsed = time.monotonic() - start
+        self.assertEqual(results, [])
+        self.assertLess(elapsed, 3.0)
+
+    async def test_ack_slash_defers_before_any_reply(self):
+        class FakeResponse:
+            def __init__(self):
+                self.deferred = False
+                self.calls = []
+
+            def is_done(self):
+                return self.deferred
+
+            async def defer(self, *, ephemeral=False, thinking=False):
+                self.calls.append(("defer", ephemeral, thinking))
+                self.deferred = True
+
+            async def send_message(self, *args, **kwargs):
+                self.calls.append(("send_message", args, kwargs))
+
+        class FakeFollowup:
+            def __init__(self):
+                self.calls = []
+
+            async def send(self, *args, **kwargs):
+                self.calls.append(("followup", args, kwargs))
+
+        class FakeInteraction:
+            def __init__(self):
+                self.response = FakeResponse()
+                self.followup = FakeFollowup()
+
+        interaction = FakeInteraction()
+        await bot.ack_slash(interaction)
+        self.assertEqual(interaction.response.calls, [("defer", True, True)])
+        await bot.slash_reply(interaction, "saved")
+        self.assertEqual(interaction.response.calls, [("defer", True, True)])
+        self.assertEqual(len(interaction.followup.calls), 1)
+        self.assertEqual(interaction.followup.calls[0][1][0], "saved")
+
+
+class EventLoopBlockingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_slow_fetch_in_poller_does_not_block_loop(self):
+        def slow_fetch(*args, **kwargs):
+            time.sleep(0.6)
+            return "python", []
+
+        channel = FakeChannel(101, "python", True)
+        job = {
+            "subreddit_candidates": ["python"],
+            "include_carousels": False,
+            "discord_channel_id": "101",
+            "discord_guild_id": "1",
+            "feed_mode": "new",
+            "post_limit": 5,
+            "interval_minutes": 1,
+            "media_type": "both",
+            "channel": channel,
+        }
+
+        hits = []
+
+        async def ticker():
+            start = time.monotonic()
+            while time.monotonic() - start < 0.55:
+                hits.append(time.monotonic())
+                await asyncio.sleep(0.05)
+
+        with patch.object(bot, "collect_channel_jobs", lambda: [job]), patch.object(
+            bot, "current_default_interval", lambda: 1
+        ), patch.object(bot, "fetch_posts_for_candidates", slow_fetch):
+            bot._channel_last_checked.clear()
+            bot.rotation_pointer = 0
+            started = asyncio.create_task(ticker())
+            await bot.run_reddit_post_check()
+            await started
+
+        self.assertGreaterEqual(len(hits), 6)
+        gaps = [later - earlier for earlier, later in zip(hits, hits[1:])]
+        self.assertLess(max(gaps), 0.3, f"event loop stalled, gaps={gaps}")
+
+
+class SqliteUpgradeTests(unittest.TestCase):
+    def setUp(self):
+        os.environ.pop("DATABASE_URL", None)
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.tmpdir.name) / "bot.db")
+        os.environ["SQLITE_PATH"] = self.db_path
+        db._backend_announced = False
+
+    def tearDown(self):
+        os.environ.pop("SQLITE_PATH", None)
+        self.tmpdir.cleanup()
+
+    def _create_c5378c9_database(self):
+        import sqlite3
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE posted_posts (
+                    reddit_post_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    reddit_url TEXT NOT NULL,
+                    subreddit_name TEXT NOT NULL,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    discord_channel_id TEXT NOT NULL,
+                    status TEXT DEFAULT 'posted',
+                    skip_reason TEXT,
+                    UNIQUE (reddit_post_id, discord_channel_id)
+                );
+                CREATE TABLE subreddit_configs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    subreddit_name TEXT NOT NULL,
+                    discord_channel_id TEXT NOT NULL,
+                    is_active INTEGER DEFAULT 1,
+                    created_at TEXT DEFAULT (datetime('now')),
+                    include_carousels INTEGER NOT NULL DEFAULT 0,
+                    feed_modes TEXT DEFAULT 'old,hot,new',
+                    post_limit INTEGER DEFAULT 25,
+                    discord_guild_id TEXT,
+                    UNIQUE (subreddit_name, discord_channel_id)
+                );
+                CREATE UNIQUE INDEX posted_posts_post_channel_uq
+                ON posted_posts (reddit_post_id, discord_channel_id);
+                CREATE INDEX subreddit_configs_guild_idx
+                ON subreddit_configs (discord_guild_id);
+                CREATE TABLE bot_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                INSERT INTO posted_posts (
+                    reddit_post_id, title, reddit_url, subreddit_name,
+                    discord_channel_id, status
+                ) VALUES (
+                    'old-post-1', 'Old post', 'https://reddit.com/r/aww/old-post-1',
+                    'aww', '111', 'posted'
+                );
+                INSERT INTO subreddit_configs (
+                    subreddit_name, discord_channel_id, is_active,
+                    feed_modes, post_limit, discord_guild_id
+                ) VALUES ('aww', '111', 1, 'hot,new', 10, 'guild-1');
+                INSERT INTO bot_settings (key, value)
+                VALUES ('check_interval_minutes', '2'), ('media_type', 'images');
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_upgrade_from_old_sqlite_and_posting_without_channel_settings(self):
+        self._create_c5378c9_database()
+        db.init_db()
+
+        # Old rows survive, new tables exist, no channel_settings yet.
+        self.assertTrue(db.has_been_processed("old-post-1", "111"))
+        self.assertIsNone(db.get_channel_settings("111"))
+        self.assertEqual(db.get_check_interval_minutes(default=5), 2)
+        self.assertEqual(db.get_media_type(), "images")
+
+        configs = db.get_active_subreddit_configs()
+        self.assertEqual(len(configs), 1)
+        self.assertEqual(configs[0][0], "aww")
+        self.assertEqual(configs[0][1], "111")
+
+        fallback = bot.get_channel_job_settings("111")
+        self.assertIsNone(fallback["interval_minutes"])
+        self.assertIsNone(fallback["media_type"])
+        self.assertIsNone(fallback["feed_modes"])
+
+        # New posts can still be claimed and marked.
+        self.assertTrue(
+            db.claim_post_for_channel(
+                post_id="new-post-2",
+                title="New",
+                reddit_url="https://reddit.com/r/aww/new-post-2",
+                subreddit_name="aww",
+                discord_channel_id="111",
+                media_keys=["image:abc"],
+            )
+        )
+        db.mark_as_posted(
+            post_id="new-post-2",
+            title="New",
+            reddit_url="https://reddit.com/r/aww/new-post-2",
+            subreddit_name="aww",
+            discord_channel_id="111",
+        )
+        self.assertTrue(db.already_posted_to_channel("new-post-2", "111", ["image:abc"]))
+        # The old post is still not posted again.
+        self.assertTrue(db.already_posted_to_channel("old-post-1", "111", []))
+
+        # WAL and busy timeout should be applied.
+        with db.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("PRAGMA journal_mode")
+                mode = cursor.fetchone()[0]
+                cursor.execute("PRAGMA busy_timeout")
+                timeout = cursor.fetchone()[0]
+        self.assertEqual(str(mode).lower(), "wal")
+        self.assertGreaterEqual(int(timeout), 30000)

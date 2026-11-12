@@ -121,7 +121,13 @@ def get_connection():
 
     sqlite_path = _resolve_sqlite_path()
     _announce_backend("sqlite", sqlite_path)
-    conn = sqlite3.connect(sqlite_path)
+    conn = sqlite3.connect(sqlite_path, timeout=30)
+    try:
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except sqlite3.Error as error:
+        print(f"SQLite pragma setup failed, continuing with defaults: {error}")
     return _SQLiteConnection(conn)
 
 

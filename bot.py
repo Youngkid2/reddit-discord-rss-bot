@@ -141,7 +141,7 @@ async def on_ready():
 
     print(f"Logged in as {client.user}")
 
-    init_db()
+    await asyncio.to_thread(init_db)
 
     if not slash_commands_synced:
         await sync_slash_commands_to_all_guilds()
@@ -150,8 +150,10 @@ async def on_ready():
     effective_interval = CHECK_INTERVAL_MINUTES
     effective_media = "both"
     try:
-        effective_interval = get_check_interval_minutes(default=CHECK_INTERVAL_MINUTES)
-        effective_media = get_media_type()
+        effective_interval = await asyncio.to_thread(
+            get_check_interval_minutes, default=CHECK_INTERVAL_MINUTES
+        )
+        effective_media = await asyncio.to_thread(get_media_type)
     except Exception as error:
         print(f"Failed to load saved settings, using defaults: {error}")
 
@@ -1027,14 +1029,14 @@ async def run_reddit_post_check():
 
     print("Checking guild channels for subreddit auto-mapping...")
 
-    jobs = collect_channel_jobs()
+    jobs = await asyncio.to_thread(collect_channel_jobs)
 
     if not jobs:
         print("No eligible age-restricted channel mappings found.")
         return
 
     start_index = rotation_pointer % len(jobs)
-    default_interval = current_default_interval()
+    default_interval = await asyncio.to_thread(current_default_interval)
     now = time.time()
     jobs_by_channel: dict[str, list[int]] = {}
     for index, job in enumerate(jobs):
@@ -1079,10 +1081,11 @@ async def run_reddit_post_check():
                 attempted_indexes.add(job_index)
                 continue
 
-            subreddit_name, posts = fetch_posts_for_candidates(
-                candidates=candidates,
-                feed_mode=feed_mode,
-                limit=job_post_limit,
+            subreddit_name, posts = await asyncio.to_thread(
+                fetch_posts_for_candidates,
+                candidates,
+                feed_mode,
+                job_post_limit,
             )
 
             attempted_indexes.add(job_index)
@@ -1106,7 +1109,12 @@ async def run_reddit_post_check():
                     }
                 )
 
-                if already_posted_to_channel(post_id, discord_channel_id, media_keys):
+                if await asyncio.to_thread(
+                    already_posted_to_channel,
+                    post_id,
+                    discord_channel_id,
+                    media_keys,
+                ):
                     print(f"Already processed, skipping: {title}")
                     continue
                 carousel_post = is_carousel_post(post)
@@ -1145,13 +1153,14 @@ async def run_reddit_post_check():
                     log_skip_non_nsfw(channel)
                     break
 
-                if not claim_post_for_channel(
-                    post_id=post_id,
-                    title=title,
-                    reddit_url=url,
-                    subreddit_name=subreddit,
-                    discord_channel_id=discord_channel_id,
-                    media_keys=media_keys,
+                if not await asyncio.to_thread(
+                    claim_post_for_channel,
+                    post_id,
+                    title,
+                    url,
+                    subreddit,
+                    discord_channel_id,
+                    media_keys,
                 ):
                     print(f"Already claimed, skipping: {title}")
                     continue
@@ -1166,23 +1175,28 @@ async def run_reddit_post_check():
                         },
                     )
                 except Exception:
-                    release_claim(post_id, discord_channel_id, media_keys)
+                    await asyncio.to_thread(
+                        release_claim, post_id, discord_channel_id, media_keys
+                    )
                     raise
 
                 if not media_was_sent:
-                    release_claim(post_id, discord_channel_id, media_keys)
+                    await asyncio.to_thread(
+                        release_claim, post_id, discord_channel_id, media_keys
+                    )
                     print(
                         f"Media could not be rendered or uploaded, "
                         f"skipping without marking as posted: {title}"
                     )
                     continue
 
-                mark_as_posted(
-                    post_id=post_id,
-                    title=title,
-                    reddit_url=url,
-                    subreddit_name=subreddit,
-                    discord_channel_id=discord_channel_id,
+                await asyncio.to_thread(
+                    mark_as_posted,
+                    post_id,
+                    title,
+                    url,
+                    subreddit,
+                    discord_channel_id,
                 )
                 _channel_last_checked[str(discord_channel_id)] = time.time()
 
@@ -1272,6 +1286,41 @@ def validate_modes(modes: str) -> tuple[bool, str]:
     return True, ",".join(mode_list)
 
 
+
+AUTOCOMPLETE_TIMEOUT_SECONDS = 2.5
+
+
+async def ack_slash(interaction: discord.Interaction) -> None:
+    """Acknowledge a slash command immediately so Discord does not time out."""
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+
+async def slash_reply(interaction: discord.Interaction, *args, **kwargs):
+    """Send the command reply after ack_slash(), or directly if not deferred."""
+    kwargs.setdefault("ephemeral", True)
+    if interaction.response.is_done():
+        await interaction.followup.send(*args, **kwargs)
+        return
+    await slash_reply(interaction, *args, **kwargs)
+
+
+async def search_subreddits_for_autocomplete(query: str, limit: int = 15) -> list[dict]:
+    """Search Reddit for autocomplete, but never wait more than ~2.5 seconds."""
+    if not query:
+        return []
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(search_subreddits, query, limit),
+            timeout=AUTOCOMPLETE_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        print(f"Subreddit autocomplete timed out for query length {len(query)}")
+        return []
+    except Exception as error:
+        print(f"Subreddit autocomplete failed: {error}")
+        return []
+
+
 @tree.command(
     name="drbot_add",
     description="Add or update a subreddit feed config for this server.",
@@ -1283,22 +1332,23 @@ async def drbot_add(
     limit: int = 25,
     channel: Optional[discord.TextChannel] = None,
 ):
+    await ack_slash(interaction)
     if not user_can_manage_bot(interaction):
-        await interaction.response.send_message(
+        await slash_reply(interaction, 
             "You need Manage Server or Administrator permission to use this.",
             ephemeral=True,
         )
         return
 
     if not interaction.guild_id:
-        await interaction.response.send_message(
+        await slash_reply(interaction, 
             "This command can only be used inside a Discord server.",
             ephemeral=True,
         )
         return
 
     if limit < 1 or limit > 100:
-        await interaction.response.send_message(
+        await slash_reply(interaction, 
             "Limit must be between 1 and 100.",
             ephemeral=True,
         )
@@ -1307,7 +1357,7 @@ async def drbot_add(
     modes_are_valid, normalized_modes_or_error = validate_modes(modes)
 
     if not modes_are_valid:
-        await interaction.response.send_message(
+        await slash_reply(interaction, 
             normalized_modes_or_error,
             ephemeral=True,
         )
@@ -1316,14 +1366,14 @@ async def drbot_add(
     target_channel = channel or interaction.channel
 
     if not isinstance(target_channel, discord.TextChannel):
-        await interaction.response.send_message(
+        await slash_reply(interaction, 
             "Please use this command in a text channel or provide a text channel.",
             ephemeral=True,
         )
         return
 
     if not channel_is_age_restricted(target_channel):
-        await interaction.response.send_message(
+        await slash_reply(interaction, 
             f"{target_channel.mention} is not age-restricted. "
             "This bot only posts into age-restricted (NSFW) channels.",
             ephemeral=True,
@@ -1332,14 +1382,14 @@ async def drbot_add(
 
     subreddit = normalize_subreddit_name(subreddit)
     if not is_valid_subreddit_name(subreddit):
-        await interaction.response.send_message(
+        await slash_reply(interaction, 
             "Please enter a valid subreddit name.",
             ephemeral=True,
         )
         return
 
     if is_blocked_subreddit(subreddit):
-        await interaction.response.send_message(
+        await slash_reply(interaction, 
             blocked_refusal_message([(subreddit, blocked_reason(subreddit) or "blocked")]),
             ephemeral=True,
         )
@@ -1348,7 +1398,8 @@ async def drbot_add(
     discord_guild_id = str(interaction.guild_id)
     discord_channel_id = str(target_channel.id)
 
-    upsert_subreddit_config(
+    await asyncio.to_thread(
+        upsert_subreddit_config,
         subreddit_name=subreddit,
         discord_channel_id=discord_channel_id,
         discord_guild_id=discord_guild_id,
@@ -1356,7 +1407,7 @@ async def drbot_add(
         post_limit=limit,
     )
 
-    await interaction.response.send_message(
+    await slash_reply(interaction, 
         f"Added/updated `r/{subreddit}` → {target_channel.mention}\n"
         f"Server ID: `{discord_guild_id}`\n"
         f"Channel ID: `{discord_channel_id}`\n"
@@ -1371,15 +1422,16 @@ async def drbot_add(
     description="List subreddit feed configs for this server.",
 )
 async def drbot_list(interaction: discord.Interaction):
+    await ack_slash(interaction)
     if not user_can_manage_bot(interaction):
-        await interaction.response.send_message(
+        await slash_reply(interaction, 
             "You need Manage Server or Administrator permission to use this.",
             ephemeral=True,
         )
         return
 
     if not interaction.guild_id:
-        await interaction.response.send_message(
+        await slash_reply(interaction, 
             "This command can only be used inside a Discord server.",
             ephemeral=True,
         )
@@ -1387,10 +1439,10 @@ async def drbot_list(interaction: discord.Interaction):
 
     discord_guild_id = str(interaction.guild_id)
 
-    configs = list_subreddit_configs(discord_guild_id)
+    configs = await asyncio.to_thread(list_subreddit_configs, discord_guild_id)
 
     if not configs:
-        await interaction.response.send_message(
+        await slash_reply(interaction, 
             "No subreddit configs found for this server.",
             ephemeral=True,
         )
@@ -1425,7 +1477,7 @@ async def drbot_list(interaction: discord.Interaction):
     if len(message) > 1800:
         message = message[:1800] + "\n...truncated"
 
-    await interaction.response.send_message(
+    await slash_reply(interaction, 
         message,
         ephemeral=True,
     )
@@ -1439,26 +1491,28 @@ async def drbot_remove(
     interaction: discord.Interaction,
     subreddit: str,
 ):
+    await ack_slash(interaction)
     if not user_can_manage_bot(interaction):
-        await interaction.response.send_message(
+        await slash_reply(interaction, 
             "You need Manage Server or Administrator permission to use this.",
             ephemeral=True,
         )
         return
 
     if not interaction.guild_id:
-        await interaction.response.send_message(
+        await slash_reply(interaction, 
             "This command can only be used inside a Discord server.",
             ephemeral=True,
         )
         return
 
-    deleted_count = remove_subreddit_config(
+    deleted_count = await asyncio.to_thread(
+        remove_subreddit_config,
         subreddit_name=subreddit,
         discord_guild_id=str(interaction.guild_id),
     )
 
-    await interaction.response.send_message(
+    await slash_reply(interaction, 
         f"Removed `{deleted_count}` config(s) for `r/{subreddit}` from this server.",
         ephemeral=True,
     )
@@ -1472,27 +1526,29 @@ async def drbot_pause(
     interaction: discord.Interaction,
     subreddit: str,
 ):
+    await ack_slash(interaction)
     if not user_can_manage_bot(interaction):
-        await interaction.response.send_message(
+        await slash_reply(interaction, 
             "You need Manage Server or Administrator permission to use this.",
             ephemeral=True,
         )
         return
 
     if not interaction.guild_id:
-        await interaction.response.send_message(
+        await slash_reply(interaction, 
             "This command can only be used inside a Discord server.",
             ephemeral=True,
         )
         return
 
-    updated_count = set_subreddit_active(
+    updated_count = await asyncio.to_thread(
+        set_subreddit_active,
         subreddit_name=subreddit,
         is_active=False,
         discord_guild_id=str(interaction.guild_id),
     )
 
-    await interaction.response.send_message(
+    await slash_reply(interaction, 
         f"Paused `{updated_count}` config(s) for `r/{subreddit}` in this server.",
         ephemeral=True,
     )
@@ -1506,27 +1562,29 @@ async def drbot_resume(
     interaction: discord.Interaction,
     subreddit: str,
 ):
+    await ack_slash(interaction)
     if not user_can_manage_bot(interaction):
-        await interaction.response.send_message(
+        await slash_reply(interaction, 
             "You need Manage Server or Administrator permission to use this.",
             ephemeral=True,
         )
         return
 
     if not interaction.guild_id:
-        await interaction.response.send_message(
+        await slash_reply(interaction, 
             "This command can only be used inside a Discord server.",
             ephemeral=True,
         )
         return
 
-    updated_count = set_subreddit_active(
+    updated_count = await asyncio.to_thread(
+        set_subreddit_active,
         subreddit_name=subreddit,
         is_active=True,
         discord_guild_id=str(interaction.guild_id),
     )
 
-    await interaction.response.send_message(
+    await slash_reply(interaction, 
         f"Resumed `{updated_count}` config(s) for `r/{subreddit}` in this server.",
         ephemeral=True,
     )
@@ -1540,26 +1598,28 @@ async def drbot_clear(
     interaction: discord.Interaction,
     subreddit: str,
 ):
+    await ack_slash(interaction)
     if not user_can_manage_bot(interaction):
-        await interaction.response.send_message(
+        await slash_reply(interaction, 
             "You need Manage Server or Administrator permission to use this.",
             ephemeral=True,
         )
         return
 
     if not interaction.guild_id:
-        await interaction.response.send_message(
+        await slash_reply(interaction, 
             "This command can only be used inside a Discord server.",
             ephemeral=True,
         )
         return
 
-    deleted_count = clear_processed_posts_for_subreddit(
+    deleted_count = await asyncio.to_thread(
+        clear_processed_posts_for_subreddit,
         subreddit_name=subreddit,
         discord_guild_id=str(interaction.guild_id),
     )
 
-    await interaction.response.send_message(
+    await slash_reply(interaction, 
         f"Cleared `{deleted_count}` processed post(s) for `r/{subreddit}` in this server.",
         ephemeral=True,
     )
@@ -1577,28 +1637,30 @@ async def drbot_carousels(
     subreddit: str,
     enabled: bool,
 ):
+    await ack_slash(interaction)
     if not user_can_manage_bot(interaction):
-        await interaction.response.send_message(
+        await slash_reply(interaction, 
             "You need Manage Server or Administrator permission to use this.",
             ephemeral=True,
         )
         return
 
     if not interaction.guild_id:
-        await interaction.response.send_message(
+        await slash_reply(interaction, 
             "This command can only be used inside a Discord server.",
             ephemeral=True,
         )
         return
 
-    updated_count = set_subreddit_carousels(
+    updated_count = await asyncio.to_thread(
+        set_subreddit_carousels,
         subreddit_name=subreddit,
         include_carousels=enabled,
         discord_guild_id=str(interaction.guild_id),
     )
 
     if updated_count == 0:
-        await interaction.response.send_message(
+        await slash_reply(interaction, 
             f"No saved config was found for `r/{subreddit}` in this server.",
             ephemeral=True,
         )
@@ -1606,7 +1668,7 @@ async def drbot_carousels(
 
     status = "enabled" if enabled else "disabled"
 
-    await interaction.response.send_message(
+    await slash_reply(interaction, 
         f"Carousel posts are now **{status}** for `r/{subreddit}`.",
         ephemeral=True,
     )
@@ -1624,15 +1686,16 @@ async def drbot_fetch(
     include_carousels: bool = False,
     channel: Optional[discord.TextChannel] = None,
 ):
+    await ack_slash(interaction)
     if not user_can_manage_bot(interaction):
-        await interaction.response.send_message(
+        await slash_reply(interaction, 
             "You need Manage Server or Administrator permission to use this.",
             ephemeral=True,
         )
         return
 
     if not interaction.guild_id:
-        await interaction.response.send_message(
+        await slash_reply(interaction, 
             "This command can only be used inside a Discord server.",
             ephemeral=True,
         )
@@ -1641,14 +1704,14 @@ async def drbot_fetch(
     mode = mode.strip().lower()
 
     if mode not in ALLOWED_FEED_MODES:
-        await interaction.response.send_message(
+        await slash_reply(interaction, 
             f"Invalid mode `{mode}`. Allowed: {', '.join(sorted(ALLOWED_FEED_MODES))}",
             ephemeral=True,
         )
         return
 
     if limit < 1 or limit > 100:
-        await interaction.response.send_message(
+        await slash_reply(interaction, 
             "Limit must be between 1 and 100.",
             ephemeral=True,
         )
@@ -1657,14 +1720,14 @@ async def drbot_fetch(
     target_channel = channel or interaction.channel
 
     if not isinstance(target_channel, discord.TextChannel):
-        await interaction.response.send_message(
+        await slash_reply(interaction, 
             "Please use this command in a text channel or provide a text channel.",
             ephemeral=True,
         )
         return
 
     if not channel_is_age_restricted(target_channel):
-        await interaction.response.send_message(
+        await slash_reply(interaction, 
             f"{target_channel.mention} is not age-restricted. "
             "This bot only posts into age-restricted (NSFW) channels.",
             ephemeral=True,
@@ -1673,24 +1736,23 @@ async def drbot_fetch(
 
     subreddit = normalize_subreddit_name(subreddit)
     if not is_valid_subreddit_name(subreddit):
-        await interaction.response.send_message(
+        await slash_reply(interaction, 
             "Please enter a valid subreddit name.",
             ephemeral=True,
         )
         return
 
     if is_blocked_subreddit(subreddit):
-        await interaction.response.send_message(
+        await slash_reply(interaction, 
             blocked_refusal_message([(subreddit, blocked_reason(subreddit) or "blocked")]),
             ephemeral=True,
         )
         return
 
-    await interaction.response.defer(ephemeral=True)
-
     target_channel_id = str(target_channel.id)
 
-    posts = fetch_latest_posts(
+    posts = await asyncio.to_thread(
+        fetch_latest_posts,
         subreddit_name=subreddit,
         feed_mode=mode,
         limit=limit,
@@ -1713,7 +1775,9 @@ async def drbot_fetch(
         media_keys = media_keys_for_post(
             {**post, "image_urls": image_urls, "video_urls": video_urls}
         )
-        if already_posted_to_channel(post_id, target_channel_id, media_keys):
+        if await asyncio.to_thread(
+            already_posted_to_channel, post_id, target_channel_id, media_keys
+        ):
             continue
 
         carousel_post = is_carousel_post(post)
@@ -1727,19 +1791,20 @@ async def drbot_fetch(
         try:
             if not post_matches_media_filter(
                 {"image_urls": image_urls, "video_urls": video_urls},
-                current_media_type(),
+                await asyncio.to_thread(current_media_type),
             ):
                 continue
         except Exception:
             pass
 
-        if not claim_post_for_channel(
-            post_id=post_id,
-            title=title,
-            reddit_url=url,
-            subreddit_name=subreddit,
-            discord_channel_id=target_channel_id,
-            media_keys=media_keys,
+        if not await asyncio.to_thread(
+            claim_post_for_channel,
+            post_id,
+            title,
+            url,
+            subreddit,
+            target_channel_id,
+            media_keys,
         ):
             continue
 
@@ -1749,19 +1814,24 @@ async def drbot_fetch(
                 post={**post, "image_urls": image_urls, "video_urls": video_urls},
             )
         except Exception:
-            release_claim(post_id, target_channel_id, media_keys)
+            await asyncio.to_thread(
+                release_claim, post_id, target_channel_id, media_keys
+            )
             raise
 
         if not media_was_sent:
-            release_claim(post_id, target_channel_id, media_keys)
+            await asyncio.to_thread(
+                release_claim, post_id, target_channel_id, media_keys
+            )
             continue
 
-        mark_as_posted(
-            post_id=post_id,
-            title=title,
-            reddit_url=url,
-            subreddit_name=subreddit,
-            discord_channel_id=target_channel_id,
+        await asyncio.to_thread(
+            mark_as_posted,
+            post_id,
+            title,
+            url,
+            subreddit,
+            target_channel_id,
         )
 
         await interaction.followup.send(
@@ -1862,8 +1932,6 @@ def apply_setup_settings(
             None,
         )
 
-    apply_effective_check_interval(fallback=current_default_interval())
-
     summary = {
         "channel_id": channel_id,
         "subreddits": allowed,
@@ -1957,20 +2025,22 @@ async def setup_command(
     timerange: str | None = None,
 ):
     try:
+        await ack_slash(interaction)
         error = require_manage_server(interaction)
         if error:
-            await interaction.response.send_message(error, ephemeral=True)
+            await slash_reply(interaction, error, ephemeral=True)
             return
 
         target_channel = channel or interaction.channel
         if not isinstance(target_channel, discord.TextChannel):
-            await interaction.response.send_message(
+            await slash_reply(interaction, 
                 "Please use this command in a text channel or provide a text channel.",
                 ephemeral=True,
             )
             return
 
-        ok, message, summary = apply_setup_settings(
+        ok, message, summary = await asyncio.to_thread(
+            apply_setup_settings,
             discord_guild_id=str(interaction.guild_id),
             target_channel=target_channel,
             subreddits_text=subreddits,
@@ -1979,21 +2049,24 @@ async def setup_command(
             timerange=timerange,
         )
         if not ok or summary is None:
-            await interaction.response.send_message(
+            await slash_reply(
+                interaction,
                 message or "I could not save that setup right now.",
-                ephemeral=True,
             )
             return
 
+        apply_effective_check_interval(fallback=current_default_interval())
         embed = build_setup_embed(summary, warning=message)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await slash_reply(interaction, embed=embed)
     except Exception as error:
         print(f"/setup command failed: {error}")
-        if not interaction.response.is_done():
-            await interaction.response.send_message(
+        try:
+            await slash_reply(
+                interaction,
                 "Something went wrong while saving the setup. The bot is still posting as before.",
-                ephemeral=True,
             )
+        except Exception:
+            pass
 
 
 @setup_command.autocomplete("subreddits")
@@ -2007,11 +2080,7 @@ async def setup_subreddits_autocomplete(
 
     results = []
     if query:
-        try:
-            results = await asyncio.to_thread(search_subreddits, query, 15)
-        except Exception as error:
-            print(f"Subreddit autocomplete failed: {error}")
-            results = []
+        results = await search_subreddits_for_autocomplete(query, 15)
 
     for item in results:
         name = normalize_subreddit_name(item.get("name"))
@@ -2059,48 +2128,51 @@ async def interval_command(
     minutes: int,
 ):
     try:
+        await ack_slash(interaction)
         error = require_manage_server(interaction)
         if error:
-            await interaction.response.send_message(error, ephemeral=True)
+            await slash_reply(interaction, error, ephemeral=True)
             return
 
         parsed = parse_interval(minutes)
         if parsed is None:
-            await interaction.response.send_message(
+            await slash_reply(interaction, 
                 "Please choose 1, 2, or 5 minutes.",
                 ephemeral=True,
             )
             return
 
-        saved = set_check_interval_minutes(parsed)
+        saved = await asyncio.to_thread(set_check_interval_minutes, parsed)
         applied = apply_effective_check_interval(fallback=parsed)
 
         if applied and saved:
-            await interaction.response.send_message(
+            await slash_reply(interaction, 
                 f"Done. The bot will now check Reddit every **{parsed} minute(s)**.",
                 ephemeral=True,
             )
             return
 
         if applied and not saved:
-            await interaction.response.send_message(
+            await slash_reply(interaction, 
                 f"The bot will now check Reddit every **{parsed} minute(s)**, "
                 "but I could not save this for the next restart. Try the command again later.",
                 ephemeral=True,
             )
             return
 
-        await interaction.response.send_message(
+        await slash_reply(interaction, 
             "I could not change the interval right now. The bot is still using the previous setting.",
             ephemeral=True,
         )
     except Exception as error:
         print(f"/interval command failed: {error}")
-        if not interaction.response.is_done():
-            await interaction.response.send_message(
+        try:
+            await slash_reply(
+                interaction,
                 "Something went wrong while changing the interval. The bot is still posting as before.",
-                ephemeral=True,
             )
+        except Exception:
+            pass
 
 
 @tree.command(
@@ -2121,20 +2193,21 @@ async def media_command(
     media_type: str,
 ):
     try:
+        await ack_slash(interaction)
         error = require_manage_server(interaction)
         if error:
-            await interaction.response.send_message(error, ephemeral=True)
+            await slash_reply(interaction, error, ephemeral=True)
             return
 
         kind = media_type.strip().lower() if isinstance(media_type, str) else ""
         if kind not in ALLOWED_MEDIA_TYPES:
-            await interaction.response.send_message(
+            await slash_reply(interaction, 
                 "Please choose videos, images, or both.",
                 ephemeral=True,
             )
             return
 
-        saved = set_media_type(kind)
+        saved = await asyncio.to_thread(set_media_type, kind)
         labels = {
             "videos": "videos only",
             "images": "images only",
@@ -2143,23 +2216,25 @@ async def media_command(
         label = labels[kind]
 
         if saved:
-            await interaction.response.send_message(
+            await slash_reply(interaction, 
                 f"Done. The bot will now post **{label}**.",
                 ephemeral=True,
             )
             return
 
-        await interaction.response.send_message(
+        await slash_reply(interaction, 
             "I could not save that media setting right now. The bot will keep using the previous setting.",
             ephemeral=True,
         )
     except Exception as error:
         print(f"/media command failed: {error}")
-        if not interaction.response.is_done():
-            await interaction.response.send_message(
+        try:
+            await slash_reply(
+                interaction,
                 "Something went wrong while changing the media setting. The bot is still posting as before.",
-                ephemeral=True,
             )
+        except Exception:
+            pass
 
 
 @tree.command(
@@ -2169,18 +2244,21 @@ async def media_command(
 @app_commands.default_permissions(manage_guild=True)
 async def status_command(interaction: discord.Interaction):
     try:
+        await ack_slash(interaction)
         error = require_manage_server(interaction)
         if error:
-            await interaction.response.send_message(error, ephemeral=True)
+            await slash_reply(interaction, error, ephemeral=True)
             return
 
         try:
-            interval = get_check_interval_minutes(default=CHECK_INTERVAL_MINUTES)
+            interval = await asyncio.to_thread(
+                get_check_interval_minutes, default=CHECK_INTERVAL_MINUTES
+            )
         except Exception:
             interval = CHECK_INTERVAL_MINUTES
 
         try:
-            media_type = get_media_type()
+            media_type = await asyncio.to_thread(get_media_type)
         except Exception:
             media_type = "both"
 
@@ -2193,14 +2271,15 @@ async def status_command(interaction: discord.Interaction):
         ]
 
         try:
-            jobs = collect_channel_jobs()
+            jobs = await asyncio.to_thread(collect_channel_jobs)
         except Exception as job_error:
             print(f"/status could not list channels: {job_error}")
             jobs = []
 
         settings_by_channel = {}
         try:
-            for row in list_channel_settings(str(interaction.guild_id)):
+            rows = await asyncio.to_thread(list_channel_settings, str(interaction.guild_id))
+            for row in rows:
                 settings_by_channel[row["discord_channel_id"]] = row
         except Exception as settings_error:
             print(f"/status could not list channel settings: {settings_error}")
@@ -2243,14 +2322,16 @@ async def status_command(interaction: discord.Interaction):
         if len(message) > 1800:
             message = message[:1800] + "\n...truncated"
 
-        await interaction.response.send_message(message, ephemeral=True)
+        await slash_reply(interaction, message, ephemeral=True)
     except Exception as error:
         print(f"/status command failed: {error}")
-        if not interaction.response.is_done():
-            await interaction.response.send_message(
+        try:
+            await slash_reply(
+                interaction,
                 "Something went wrong while reading the current settings.",
-                ephemeral=True,
             )
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
