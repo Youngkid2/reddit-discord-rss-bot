@@ -46,7 +46,7 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
 POST_LIMIT = int(os.getenv("POST_LIMIT", 25))
 CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", 5))
-MAX_MEDIA_UPLOAD_BYTES = int(os.getenv("MAX_MEDIA_UPLOAD_BYTES", str(8 * 1024 * 1024)))
+MAX_MEDIA_UPLOAD_BYTES = int(os.getenv("MAX_MEDIA_UPLOAD_BYTES", str(10 * 1000 * 1000 - 200 * 1000)))
 INCLUDE_CAROUSELS = os.getenv("INCLUDE_CAROUSELS", "false").strip().lower() in {
     "1",
     "true",
@@ -276,6 +276,58 @@ def download_reddit_video(video_url: str):
         return None
 
     silent_fallback = None
+
+    def shrink_same_size(video, audio):
+        """Re-encode at the same resolution with sound, small enough to upload."""
+        with tempfile.TemporaryDirectory() as tmp:
+            v_path = os.path.join(tmp, "v.mp4")
+            a_path = os.path.join(tmp, "a.mp4")
+            out_path = os.path.join(tmp, "out.mp4")
+            with open(v_path, "wb") as f:
+                f.write(video)
+            with open(a_path, "wb") as f:
+                f.write(audio)
+            probe = subprocess.run(
+                [ffmpeg, "-i", v_path], capture_output=True, text=True
+            )
+            m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", probe.stderr)
+            if not m:
+                return None
+            seconds = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+            if seconds <= 0:
+                return None
+            total_kbit = MAX_MEDIA_UPLOAD_BYTES * 8 / 1000 * 0.92
+            video_kbps = int(total_kbit / seconds) - 96
+            if video_kbps < 300:
+                return None
+            result = subprocess.run(
+                [ffmpeg, "-y", "-loglevel", "error", "-i", v_path, "-i", a_path,
+                 "-map", "0:v:0", "-map", "1:a:0?", "-c:v", "libx264",
+                 "-preset", "veryfast", "-b:v", f"{video_kbps}k",
+                 "-maxrate", f"{video_kbps}k", "-bufsize", f"{video_kbps * 2}k",
+                 "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", out_path],
+                capture_output=True,
+                timeout=600,
+            )
+            if result.returncode == 0 and os.path.exists(out_path):
+                with open(out_path, "rb") as f:
+                    data = f.read()
+                if len(data) <= MAX_MEDIA_UPLOAD_BYTES:
+                    return data
+        return None
+
+    # Best quality first: if the top quality with sound is too big, keep the
+    # same resolution and compress it instead of dropping to a smaller size.
+    if video_names and audio_tracks:
+        top = fetch(video_names[0])
+        if top:
+            merged = merge(top, audio_tracks[0])
+            if merged and len(merged) <= MAX_MEDIA_UPLOAD_BYTES:
+                return merged, "reddit_video.mp4"
+            if len(top) <= 60 * 1000 * 1000:
+                shrunk = shrink_same_size(top, audio_tracks[0])
+                if shrunk:
+                    return shrunk, "reddit_video.mp4"
 
     # Prefer sound: try every video quality with every audio quality
     # (best first) and only post a silent video if nothing with sound fits.
