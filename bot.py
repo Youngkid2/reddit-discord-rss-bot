@@ -128,8 +128,16 @@ def is_carousel_post(post: dict) -> bool:
     image_urls = post.get("image_urls", [])
     media_hint = post.get("media_hint", "")
 
+    # Reddit RSS lists the same picture twice (preview.redd.it thumbnail
+    # + full i.redd.it file). Count unique image ids, not raw URLs.
+    unique_ids = {
+        os.path.splitext(urlparse(u).path.rsplit("/", 1)[-1])[0]
+        for u in image_urls
+        if "external-preview" not in u
+    }
+
     return (
-        len(image_urls) > 1
+        len(unique_ids) > 1
         or media_hint == "possible_gallery"
     )
 
