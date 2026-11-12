@@ -2,6 +2,10 @@ import asyncio
 import io
 import mimetypes
 import os
+import tempfile
+import subprocess
+import shutil
+import re
 from urllib.parse import urlparse
 
 import requests
@@ -194,6 +198,90 @@ def normalize_redgifs_embed_url(url: str) -> str | None:
 
     return f"https://www.redgifs.com/watch/{media_id}"
 
+
+def _ffmpeg_path():
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return shutil.which("ffmpeg")
+
+
+def download_reddit_video(video_url: str):
+    """
+    Reddit videos (v.redd.it) are not direct files. Read the DASH playlist,
+    pick the best video quality that fits Discord's upload limit, and merge
+    the audio track with ffmpeg when one exists.
+    """
+    headers = {"User-Agent": "RedditDiscordBot/1.0 (RSS client)"}
+    parsed = urlparse(video_url)
+    parts = [p for p in parsed.path.split("/") if p]
+    if not parts:
+        return None
+    base = f"https://v.redd.it/{parts[0]}"
+
+    try:
+        mpd = requests.get(f"{base}/DASHPlaylist.mpd", headers=headers, timeout=20)
+        mpd.raise_for_status()
+    except requests.RequestException as error:
+        print(f"Failed to read Reddit video playlist {base}: {error}")
+        return None
+
+    names = re.findall(r"<BaseURL>([^<]+)</BaseURL>", mpd.text)
+    audio_names = [n for n in names if "AUDIO" in n.upper()]
+    video_names = [n for n in names if "AUDIO" not in n.upper()]
+
+    def quality(name):
+        m = re.search(r"_(\d+)", name)
+        return int(m.group(1)) if m else 0
+
+    video_names.sort(key=quality, reverse=True)
+    audio_names.sort(key=quality, reverse=True)
+
+    def fetch(name):
+        try:
+            r = requests.get(f"{base}/{name}", headers=headers, timeout=60)
+            r.raise_for_status()
+            return r.content
+        except requests.RequestException:
+            return None
+
+    audio = fetch(audio_names[0]) if audio_names else None
+    ffmpeg = _ffmpeg_path()
+
+    for name in video_names:
+        video = fetch(name)
+        if not video or len(video) > MAX_MEDIA_UPLOAD_BYTES:
+            continue
+
+        if audio and ffmpeg:
+            with tempfile.TemporaryDirectory() as tmp:
+                v_path = os.path.join(tmp, "v.mp4")
+                a_path = os.path.join(tmp, "a.mp4")
+                out_path = os.path.join(tmp, "out.mp4")
+                with open(v_path, "wb") as f:
+                    f.write(video)
+                with open(a_path, "wb") as f:
+                    f.write(audio)
+                result = subprocess.run(
+                    [ffmpeg, "-y", "-loglevel", "error", "-i", v_path,
+                     "-i", a_path, "-c", "copy", "-map", "0:v:0",
+                     "-map", "1:a:0?", "-movflags", "+faststart", out_path],
+                    capture_output=True,
+                    timeout=120,
+                )
+                if result.returncode == 0 and os.path.exists(out_path):
+                    with open(out_path, "rb") as f:
+                        merged = f.read()
+                    if len(merged) <= MAX_MEDIA_UPLOAD_BYTES:
+                        return merged, "reddit_video.mp4"
+
+        return video, "reddit_video.mp4"
+
+    print(f"No Reddit video quality fits the upload limit: {video_url}")
+    return None
+
+
 def download_direct_video(video_url: str):
     """
     Download a direct video URL into memory.
@@ -305,10 +393,13 @@ async def send_video_as_attachment(
             )
             return False
 
-    result = await asyncio.to_thread(
-        download_direct_video,
-        video_url,
-    )
+    if urlparse(video_url).netloc.lower() == "v.redd.it":
+        result = await asyncio.to_thread(download_reddit_video, video_url)
+    else:
+        result = await asyncio.to_thread(
+            download_direct_video,
+            video_url,
+        )
 
     if result is None:
         return False
@@ -345,17 +436,8 @@ async def send_reddit_post_to_discord(
 
     media_sent = False
 
-    for image_url in image_urls:
-        try:
-            embed = discord.Embed()
-            embed.set_image(url=image_url)
-
-            await channel.send(embed=embed)
-            media_sent = True
-
-        except discord.HTTPException as error:
-            print(f"Failed to send image embed {image_url}: {error}")
-
+    # Videos first. When a video uploads, skip its thumbnail images so
+    # the channel does not get a duplicate preview picture.
     for video_url in video_urls:
         try:
             video_was_sent = await send_video_as_attachment(
@@ -368,6 +450,20 @@ async def send_reddit_post_to_discord(
 
         except discord.HTTPException as error:
             print(f"Failed to upload video {video_url}: {error}")
+
+    if media_sent:
+        return True
+
+    for image_url in image_urls:
+        try:
+            embed = discord.Embed()
+            embed.set_image(url=image_url)
+
+            await channel.send(embed=embed)
+            media_sent = True
+
+        except discord.HTTPException as error:
+            print(f"Failed to send image embed {image_url}: {error}")
 
     return media_sent
 
