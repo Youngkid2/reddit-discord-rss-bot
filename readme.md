@@ -35,7 +35,9 @@ This starts Postgres and the bot. Processed posts are stored in Postgres so the 
 
 ### Run without Docker
 
-Install Python 3.10+, create a Postgres database, install `requirements.txt`, set `DISCORD_TOKEN` and `DATABASE_URL` in `.env`, then:
+Install Python 3.10+, install `requirements.txt`, and set `DISCORD_TOKEN` in `.env`. A Postgres database is optional.
+
+If you use Postgres, set `DATABASE_URL` and run the migrations first:
 
 ```bash
 python migrate_config_settings.py
@@ -44,12 +46,29 @@ python migrate_multiserver_support.py
 python bot.py
 ```
 
+If you do not set `DATABASE_URL`, the bot uses SQLite automatically. Then just run:
+
+```bash
+python bot.py
+```
+
+## FadeHost free plan
+
+The FadeHost free plan has no database addon. You do **not** need Postgres or `DATABASE_URL`.
+
+1. Paste your Discord bot token into FadeHost's token field. The host sets `DISCORD_TOKEN` for you.
+2. Leave every other environment variable empty. They are all optional.
+3. The bot stores its data in a SQLite file on the persistent disk at `/data/bot.db` (3 GB is plenty).
+
+No database, no extra env vars, and no migration commands are required. After the bot comes online, create an age-restricted Discord channel named after the subreddit (for example `#aww` for `r/aww`).
+
 ## Useful env vars
 
 | Variable | Purpose |
 | --- | --- |
-| `DISCORD_TOKEN` | Bot token (required) |
-| `DATABASE_URL` | Postgres URL (set automatically in Docker) |
+| `DISCORD_TOKEN` | Bot token (required; FadeHost sets this from the token field) |
+| `DATABASE_URL` | Optional Postgres URL. If unset, the bot uses SQLite. |
+| `SQLITE_PATH` | Optional SQLite file path. Defaults to `/data/bot.db` when `/data` is writable, otherwise `./bot.db`. |
 | `CHECK_INTERVAL_MINUTES` | Poll interval (default `5`) |
 | `POST_LIMIT` | Max RSS entries to consider per feed (default `25`) |
 | `FEED_MODES` | RSS modes to rotate, e.g. `old,hot,new` |
