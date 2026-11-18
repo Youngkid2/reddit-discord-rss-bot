@@ -1,3 +1,4 @@
+import calendar
 import html
 import re
 import json
@@ -309,6 +310,17 @@ def detect_media_candidate(entry) -> tuple[bool, str]:
 
     return False, "no_media_detected"
 
+def entry_published_ts(entry) -> float | None:
+    """Unix time the Reddit post was published, if the feed says."""
+    parsed = entry.get("published_parsed") or entry.get("updated_parsed")
+    if not parsed:
+        return None
+    try:
+        return float(calendar.timegm(parsed))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def fetch_latest_posts(
     subreddit_name: str,
     feed_mode: str = "new",
@@ -356,6 +368,7 @@ def fetch_latest_posts(
                 "media_hint": media_hint,
                 "subreddit": subreddit_name,
                 "feed_mode": feed_mode,
+                "published_ts": entry_published_ts(entry),
             }
         )
 
