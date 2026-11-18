@@ -6,6 +6,7 @@ import tempfile
 import subprocess
 import shutil
 import re
+import threading
 import time
 from urllib.parse import urlparse
 
@@ -81,6 +82,16 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
 POST_LIMIT = int(os.getenv("POST_LIMIT", 25))
 CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", 5))
+# Most new items one channel can receive in a single check. Keeps a first
+# run or a big backlog from flooding a channel; the rest go next check.
+MAX_POSTS_PER_CYCLE = max(1, int(os.getenv("MAX_POSTS_PER_CYCLE", 10)))
+# How many channels are checked and posted to at the same time.
+# Set to 1 to check one channel after another.
+MAX_PARALLEL_CHANNELS = max(1, int(os.getenv("MAX_PARALLEL_CHANNELS", 3)))
+# A channel counts as due this many seconds early, so tiny timing jitter
+# never makes it skip a whole loop tick.
+DUE_SLACK_SECONDS = 5
+FRESH_FEED_MODES = ("old", "new")
 MAX_MEDIA_UPLOAD_BYTES = int(os.getenv("MAX_MEDIA_UPLOAD_BYTES", str(10 * 1000 * 1000 - 200 * 1000)))
 INCLUDE_CAROUSELS = os.getenv("INCLUDE_CAROUSELS", "false").strip().lower() in {
     "1",
@@ -250,6 +261,12 @@ def normalize_redgifs_embed_url(url: str) -> str | None:
     return f"https://www.redgifs.com/watch/{media_id}"
 
 
+# Re-encoding a video uses a lot of CPU and memory. Channels run in
+# parallel, but only one re-encode runs at a time so a small host is not
+# overloaded (two at once would not finish any sooner on one CPU).
+_video_encode_slot = threading.BoundedSemaphore(1)
+
+
 def _ffmpeg_path():
     try:
         import imageio_ffmpeg
@@ -351,15 +368,16 @@ def download_reddit_video(video_url: str):
             video_kbps = int(total_kbit / seconds) - 96
             if video_kbps < 300:
                 return None
-            result = subprocess.run(
-                [ffmpeg, "-y", "-loglevel", "error", "-i", v_path, "-i", a_path,
-                 "-map", "0:v:0", "-map", "1:a:0?", "-c:v", "libx264",
-                 "-preset", "veryfast", "-b:v", f"{video_kbps}k",
-                 "-maxrate", f"{video_kbps}k", "-bufsize", f"{video_kbps * 2}k",
-                 "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", out_path],
-                capture_output=True,
-                timeout=600,
-            )
+            with _video_encode_slot:
+                result = subprocess.run(
+                    [ffmpeg, "-y", "-loglevel", "error", "-i", v_path, "-i", a_path,
+                     "-map", "0:v:0", "-map", "1:a:0?", "-c:v", "libx264",
+                     "-preset", "veryfast", "-b:v", f"{video_kbps}k",
+                     "-maxrate", f"{video_kbps}k", "-bufsize", f"{video_kbps * 2}k",
+                     "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", out_path],
+                    capture_output=True,
+                    timeout=600,
+                )
             if result.returncode == 0 and os.path.exists(out_path):
                 with open(out_path, "rb") as f:
                     data = f.read()
@@ -948,7 +966,7 @@ def channel_is_due(
     clock = time.time() if now is None else now
     history = _channel_last_checked if last_checked is None else last_checked
     last = history.get(str(channel_id), 0)
-    return (clock - last) >= (minutes * 60) - 0.5
+    return (clock - last) >= (minutes * 60) - DUE_SLACK_SECONDS
 
 
 def current_default_interval() -> int:
@@ -1024,8 +1042,34 @@ async def check_reddit_posts():
             _poll_in_progress = False
 
 
+def feed_priority(feed_mode: str) -> int:
+    """Fresh feeds (old/new) run before hot/top so new posts are never held up."""
+    return 0 if feed_mode in FRESH_FEED_MODES else 1
+
+
+def feed_fetch_key(job: dict) -> tuple:
+    """'old' and 'new' read the same Reddit URL, so fetch it once per cycle."""
+    mode = job["feed_mode"]
+    return (
+        tuple(job["subreddit_candidates"]),
+        "new" if mode in FRESH_FEED_MODES else mode,
+    )
+
+
+def post_age_text(post: dict) -> str:
+    published = post.get("published_ts")
+    if not published:
+        return ""
+    minutes = max(0, int((time.time() - published) // 60))
+    return f" (Reddit post is {minutes} min old)"
+
+
 async def run_reddit_post_check():
     global rotation_pointer
+
+    # Stamp the cycle start before any slow work. A channel's next check then
+    # lines up with the next loop tick instead of slipping past it.
+    cycle_started = time.time()
 
     print("Checking guild channels for subreddit auto-mapping...")
 
@@ -1035,18 +1079,80 @@ async def run_reddit_post_check():
         print("No eligible age-restricted channel mappings found.")
         return
 
-    start_index = rotation_pointer % len(jobs)
     default_interval = await asyncio.to_thread(current_default_interval)
-    now = time.time()
-    jobs_by_channel: dict[str, list[int]] = {}
-    for index, job in enumerate(jobs):
-        jobs_by_channel.setdefault(job["discord_channel_id"], []).append(index)
-    attempted_indexes: set[int] = set()
 
-    # Try every channel/mode pair until we find one unposted post.
-    for offset in range(len(jobs)):
-        job_index = (start_index + offset) % len(jobs)
-        job = jobs[job_index]
+    jobs_by_channel: dict[str, list[dict]] = {}
+    for job in jobs:
+        jobs_by_channel.setdefault(job["discord_channel_id"], []).append(job)
+
+    # Rotate which channel goes first so a slow channel cannot always
+    # make the same other channels wait.
+    channel_ids = list(jobs_by_channel)
+    start_index = rotation_pointer % len(channel_ids)
+    rotation_pointer = start_index + 1
+
+    due_channels: list[list[dict]] = []
+
+    for offset in range(len(channel_ids)):
+        discord_channel_id = channel_ids[(start_index + offset) % len(channel_ids)]
+        channel_jobs = jobs_by_channel[discord_channel_id]
+        interval_minutes = channel_jobs[0].get("interval_minutes") or default_interval
+
+        if not channel_is_due(discord_channel_id, interval_minutes, now=cycle_started):
+            continue
+
+        _channel_last_checked[str(discord_channel_id)] = cycle_started
+        due_channels.append(channel_jobs)
+
+    # Channels are independent, so check several at once. Posts inside one
+    # channel still go out in order. A slow video in one channel no longer
+    # holds up every other channel.
+    slots = asyncio.Semaphore(MAX_PARALLEL_CHANNELS)
+
+    async def check_channel(channel_jobs: list[dict]) -> int:
+        async with slots:
+            try:
+                return await post_new_items_for_channel(channel_jobs)
+            except Exception as error:
+                print(
+                    f"Error while checking channel "
+                    f"{channel_jobs[0]['discord_channel_id']}: {error}"
+                )
+                return 0
+
+    results = await asyncio.gather(
+        *(check_channel(channel_jobs) for channel_jobs in due_channels)
+    )
+    total_posted = sum(results)
+
+    if total_posted:
+        print(f"Posted {total_posted} new item(s) this cycle.")
+    else:
+        print("No unposted posts found in any mapped age-restricted channel.")
+
+
+async def post_new_items_for_channel(channel_jobs: list[dict]) -> int:
+    """
+    Post every unposted item for one channel, up to MAX_POSTS_PER_CYCLE.
+
+    Returns how many items were posted.
+    """
+    posted_count = 0
+    fetched_keys: set[tuple] = set()
+    channel = None
+
+    for job in sorted(channel_jobs, key=lambda item: feed_priority(item["feed_mode"])):
+        if posted_count >= MAX_POSTS_PER_CYCLE:
+            print(
+                f"Reached {MAX_POSTS_PER_CYCLE} posts for channel "
+                f"{job['discord_channel_id']} this cycle; the rest wait for the next one."
+            )
+            break
+
+        fetch_key = feed_fetch_key(job)
+        if fetch_key in fetched_keys:
+            continue
+        fetched_keys.add(fetch_key)
 
         candidates = job["subreddit_candidates"]
         include_carousels = job["include_carousels"]
@@ -1054,12 +1160,8 @@ async def run_reddit_post_check():
         discord_guild_id = job["discord_guild_id"]
         feed_mode = job["feed_mode"]
         job_post_limit = job["post_limit"]
-        interval_minutes = job.get("interval_minutes") or default_interval
         job_media_type = job.get("media_type") or current_media_type()
         candidate_label = " / ".join(f"r/{name}" for name in candidates)
-
-        if not channel_is_due(discord_channel_id, interval_minutes, now=now):
-            continue
 
         print(
             f"Trying {candidate_label} [{feed_mode}] "
@@ -1067,7 +1169,8 @@ async def run_reddit_post_check():
         )
 
         try:
-            channel = job.get("channel")
+            if channel is None:
+                channel = job.get("channel")
 
             if channel is None:
                 channel_id = int(discord_channel_id)
@@ -1078,8 +1181,7 @@ async def run_reddit_post_check():
 
             if not channel_is_age_restricted(channel):
                 log_skip_non_nsfw(channel)
-                attempted_indexes.add(job_index)
-                continue
+                return posted_count
 
             subreddit_name, posts = await asyncio.to_thread(
                 fetch_posts_for_candidates,
@@ -1088,12 +1190,15 @@ async def run_reddit_post_check():
                 job_post_limit,
             )
 
-            attempted_indexes.add(job_index)
-
             if not posts:
                 continue
 
+            job_posted = 0
+
             for post in posts:
+                if posted_count >= MAX_POSTS_PER_CYCLE:
+                    break
+
                 post_id = post["id"]
                 title = post["title"]
                 url = post["url"]
@@ -1151,7 +1256,7 @@ async def run_reddit_post_check():
                 # Final safety check immediately before sending.
                 if not channel_is_age_restricted(channel):
                     log_skip_non_nsfw(channel)
-                    break
+                    return posted_count
 
                 if not await asyncio.to_thread(
                     claim_post_for_channel,
@@ -1198,20 +1303,16 @@ async def run_reddit_post_check():
                     subreddit,
                     discord_channel_id,
                 )
-                _channel_last_checked[str(discord_channel_id)] = time.time()
 
-                print(f"Posted to Discord: {title}")
+                posted_count += 1
+                job_posted += 1
+                print(f"Posted to Discord{post_age_text(post)}: {title}")
 
-                # Next cycle starts from the next subreddit/mode pair.
-                rotation_pointer = job_index + 1
-
-                # Important: only one Reddit post per cycle.
-                return
-
-            print(
-                f"All candidate posts were repeats for "
-                f"r/{subreddit_name} [{feed_mode}]."
-            )
+            if not job_posted:
+                print(
+                    f"All candidate posts were repeats for "
+                    f"r/{subreddit_name} [{feed_mode}]."
+                )
 
         except Exception as error:
             print(
@@ -1219,11 +1320,7 @@ async def run_reddit_post_check():
                 f"{candidate_label} [{feed_mode}]: {error}"
             )
 
-    for channel_id, indexes in jobs_by_channel.items():
-        if indexes and all(index in attempted_indexes for index in indexes):
-            _channel_last_checked[str(channel_id)] = time.time()
-
-    print("No unposted posts found in any mapped age-restricted channel.")
+    return posted_count
 
 
 ALLOWED_FEED_MODES = {

@@ -216,5 +216,158 @@ class EndToEndAutomapTests(unittest.TestCase):
         self.assertEqual(len(self.processed), 1)
 
 
+class PostingSpeedTests(EndToEndAutomapTests):
+    """New posts must reach Discord on the next check, not one per check."""
+
+    # Don't re-run the inherited tests in this class.
+    test_collects_only_nsfw_mapped_channel = None
+    test_real_rss_posts_only_to_nsfw_channel_and_dedupes = None
+
+    @staticmethod
+    def _fake_posts(subreddit: str, count: int):
+        return [
+            {
+                "id": f"t3_{subreddit}{n}",
+                "title": f"{subreddit} {n}",
+                "url": f"https://www.reddit.com/r/{subreddit}/comments/{subreddit}{n}/x/",
+                "image_urls": [f"https://i.redd.it/{subreddit}{n}.jpg"],
+                "video_urls": [],
+                "subreddit": subreddit,
+                "feed_mode": "new",
+            }
+            for n in range(count)
+        ]
+
+    def _add_nsfw_channel(self, channel_id: int, name: str) -> FakeChannel:
+        channel = FakeChannel(channel_id, name, nsfw=True)
+        channel.guild = self.guild
+        self.guild.text_channels.append(channel)
+        self.client = FakeClient([self.guild])
+        return channel
+
+    def _run(self, feeds: dict, checks, send=None):
+        async def default_send(channel, post):
+            await channel.send(post["id"])
+            return True
+
+        patches = self._db_patches() + (
+            patch.object(
+                bot,
+                "fetch_latest_posts",
+                lambda **kwargs: list(feeds.get(kwargs["subreddit_name"], [])),
+            ),
+            patch.object(
+                bot,
+                "send_reddit_post_to_discord",
+                AsyncMock(side_effect=send or default_send),
+            ),
+            patch.object(bot, "current_default_interval", lambda: 5),
+            patch.object(bot, "current_media_type", lambda: "both"),
+        )
+        with contextlib.ExitStack() as stack:
+            for item in patches:
+                stack.enter_context(item)
+            asyncio.run(checks())
+
+    def test_one_check_posts_every_new_item_in_every_channel(self):
+        aww = self._add_nsfw_channel(104, "aww")
+        feeds = {
+            "python": self._fake_posts("python", 3),
+            "aww": self._fake_posts("aww", 2),
+        }
+        self._run(feeds, bot.check_reddit_posts)
+
+        self.assertEqual(len(self.python.sent), 3)
+        self.assertEqual(len(aww.sent), 2)
+
+    def test_cap_per_check_leaves_the_rest_for_the_next_check(self):
+        feeds = {"python": self._fake_posts("python", 5)}
+
+        async def two_checks():
+            await bot.check_reddit_posts()
+            self.assertEqual(len(self.python.sent), 2)
+            bot._channel_last_checked.clear()
+            await bot.check_reddit_posts()
+
+        with patch.object(bot, "MAX_POSTS_PER_CYCLE", 2):
+            self._run(feeds, two_checks)
+
+        self.assertEqual(len(self.python.sent), 4)
+
+    def test_slow_upload_does_not_skip_the_next_tick(self):
+        start = 1_800_000_000.0
+        clock = {"t": start}
+        feeds = {"python": self._fake_posts("python", 1)}
+
+        async def slow_send(channel, post):
+            clock["t"] += 20  # download + upload time
+            await channel.send(post["id"])
+            return True
+
+        async def two_ticks():
+            await bot.check_reddit_posts()
+            # A new post appears, and the 5-minute loop ticks again.
+            feeds["python"] = self._fake_posts("python", 2)
+            clock["t"] = start + 5 * 60
+            await bot.check_reddit_posts()
+
+        fake_time = type("FakeTime", (), {"time": staticmethod(lambda: clock["t"])})
+        with patch.object(bot, "time", fake_time):
+            self._run(feeds, two_ticks, send=slow_send)
+
+        self.assertEqual(len(self.python.sent), 2)
+
+    def test_slow_channel_does_not_hold_up_other_channels(self):
+        aww = self._add_nsfw_channel(104, "aww")
+        feeds = {
+            "python": self._fake_posts("python", 1),
+            "aww": self._fake_posts("aww", 1),
+        }
+        order = []
+        events = {}
+
+        async def send(channel, post):
+            if channel is self.python:
+                # A slow video: it only finishes after the other channel
+                # has posted. Checked one by one, this would time out.
+                await asyncio.wait_for(events["aww_posted"].wait(), timeout=2)
+            await channel.send(post["id"])
+            order.append(channel.name)
+            if channel is aww:
+                events["aww_posted"].set()
+            return True
+
+        async def check():
+            events["aww_posted"] = asyncio.Event()
+            await bot.check_reddit_posts()
+
+        with patch.object(bot, "MAX_PARALLEL_CHANNELS", 3):
+            self._run(feeds, check, send=send)
+
+        self.assertEqual(order, ["aww", "python"])
+
+    def test_parallel_channels_respect_the_limit(self):
+        self._add_nsfw_channel(104, "aww")
+        self._add_nsfw_channel(105, "pics")
+        feeds = {
+            name: self._fake_posts(name, 1) for name in ("python", "aww", "pics")
+        }
+        in_flight = {"now": 0, "max": 0, "done": 0}
+
+        async def send(channel, post):
+            in_flight["now"] += 1
+            in_flight["max"] = max(in_flight["max"], in_flight["now"])
+            await asyncio.sleep(0.05)
+            in_flight["now"] -= 1
+            in_flight["done"] += 1
+            return True
+
+        with patch.object(bot, "MAX_PARALLEL_CHANNELS", 2):
+            self._run(feeds, bot.check_reddit_posts, send=send)
+
+        self.assertEqual(in_flight["done"], 3)
+        self.assertEqual(in_flight["max"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()
