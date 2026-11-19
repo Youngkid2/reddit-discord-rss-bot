@@ -52,7 +52,7 @@ cp .env.example .env
 docker compose up --build
 ```
 
-This starts Postgres and the bot. Processed posts are stored in Postgres so the same Reddit post is not sent twice to the same channel. The bot polls on `CHECK_INTERVAL_MINUTES` (default 5). On each check it posts every new item for every due channel, up to `MAX_POSTS_PER_CYCLE` (default 10) per channel, so new Reddit posts arrive within one interval. Each subreddit feed is downloaded once per check.
+This starts Postgres and the bot. Processed posts are stored in Postgres so the same Reddit post is not sent twice to the same channel. The bot polls on `CHECK_INTERVAL_MINUTES` (default 5) and posts one item per cycle to stay within Reddit rate limits.
 
 ### Run without Docker
 
@@ -94,9 +94,7 @@ To get an update (for example the `/setup` panel): sync your GitHub fork, then t
 | `SQLITE_PATH` | Optional SQLite file path. Defaults to `/data/bot.db` when `/data` is writable, otherwise `./bot.db`. |
 | `CHECK_INTERVAL_MINUTES` | Poll interval (default `5`) |
 | `POST_LIMIT` | Max RSS entries to consider per feed (default `25`) |
-| `MAX_POSTS_PER_CYCLE` | Most new items posted to one channel per check (default `10`). The rest are posted on the next check. |
-| `MAX_PARALLEL_CHANNELS` | How many channels are checked at the same time (default `3`), so a slow video in one channel does not hold up the others. Only one video is compressed at a time. Set to `1` if the host runs low on memory. |
-| `FEED_MODES` | RSS modes to read, e.g. `old,hot,new`. `old`/`new` are checked first. `hot` and `top` posts are often hours old by nature, so use only `new` (or `/setup` timerange **new**) if you want just the freshest posts. |
+| `FEED_MODES` | RSS modes to rotate, e.g. `old,hot,new` |
 | `IGNORE_CHANNELS` | Channel names to skip |
 | `CHANNEL_SUBREDDIT_MAP` | Manual channel → subreddit overrides |
 | `INCLUDE_CAROUSELS` | Include gallery posts for auto-mapped channels (`true`/`false`) |
